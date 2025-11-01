@@ -7,9 +7,9 @@ cargo build --quiet
 pids=()
 
 # Start the nodes
-./target/debug/rust_sorcket_server 7001 & pids+=($!)
-./target/debug/rust_sorcket_server 7002 & pids+=($!)
-./target/debug/rust_sorcket_server 7003 & pids+=($!)
+./target/debug/rust_socket_server 7001 & pids+=($!)
+./target/debug/rust_socket_server 7002 & pids+=($!)
+./target/debug/rust_socket_server 7003 & pids+=($!)
 
 cleanup() {
   if ((${#pids[@]})); then
