@@ -116,7 +116,7 @@ async fn set_network(
     for i in 0..nodes {
         let port = base_port + i;
         let addr = format!("{host}:{port}");
-        let mut child = Command::new(&exe)
+        let child = Command::new(&exe)
             .arg("run")
             .arg("--addr")
             .arg(&addr)
@@ -158,7 +158,7 @@ async fn set_network(
 }
 
 fn current_exe() -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
-    Ok(std::env::current_exe()?)
+    Ok(env::current_exe()?)
 }
 
 async fn wait_until_listening(

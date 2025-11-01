@@ -18,7 +18,7 @@ use tokio::{
 /// - We keep **no persistent topology** for WALK. The entire path is carried
 ///   inside the message (`history`) hop-by-hop.
 /// - Only the *start node* allocates a short-lived "pending walk" entry
-///   (a oneshot sender keyed by `token`) so we can reply on the same client
+///   (an oneshot sender keyed by `token`) so we can reply on the same client
 ///   connection when the loop closes.
 #[derive(Debug)]
 pub struct Node {

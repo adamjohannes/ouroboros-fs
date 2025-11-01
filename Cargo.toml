@@ -8,7 +8,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 
 [lib]
-name = "ring"           # the library crate name users/tests will import
+name = "ring"
 path = "src/lib.rs"
 
 [[bin]]

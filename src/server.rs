@@ -220,7 +220,7 @@ async fn handle_walk_hop<W: AsyncWrite + Unpin>(
             eprintln!("[{}] WALK DONE send failed: {}", node.port, e);
         }
     } else {
-        // 4. Otherwise forward to the next node.
+        // 4. Otherwise, forward to the next node.
         if let Err(e) = node
             .forward_walk_hop(&token, &start_addr, &new_history)
             .await
