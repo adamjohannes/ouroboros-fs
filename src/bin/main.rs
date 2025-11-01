@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use ring::run;
-use std::{env, error::Error, path::PathBuf, time::Duration};
+use std::{env, error::Error, fs, path::Path, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -17,10 +17,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start a single node (the actual server)
+    /// Run a single node (server)
     Run {
-        /// Optional explicit address (e.g. 127.0.0.1:7000 or just 7000)
-        #[arg(short, long)]
+        /// Address to bind (e.g., 127.0.0.1:7000). If omitted, see --port / $PORT / default.
+        #[arg(long)]
         addr: Option<String>,
         /// Convenience: provide only the port; host defaults to 127.0.0.1
         #[arg(short, long)]
@@ -52,8 +52,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Run { addr, port } => {
-            let addr = resolve_listen_addr(addr, port);
-            run(&addr).await
+            let bind = resolve_listen_addr(addr, port);
+            run(&bind).await
         }
         Cmd::SetNetwork {
             nodes,
@@ -90,7 +90,7 @@ fn normalize_addr(raw: String) -> String {
     }
 }
 
-/* -------------------------- set-network -------------------------- */
+/* -------------------------- set-network ------------------------- */
 
 async fn set_network(
     nodes: u16,
@@ -104,54 +104,80 @@ async fn set_network(
         return Ok(());
     }
 
+    // Prepare a fresh "nodes/" directory each time.
+    let nodes_root = Path::new("nodes");
+    if nodes_root.exists() {
+        fs::remove_dir_all(nodes_root)?;
+    }
+    fs::create_dir_all(nodes_root)?;
+
     let exe = current_exe()?;
     println!(
-        "Starting {nodes} nodes from {host}:{base_port} using {:?}",
+        "starting {nodes} nodes at {host}:{base_port}..{} (exe: {:?})",
+        base_port + nodes - 1,
         exe
     );
 
     // 1) Spawn children
     let mut children: Vec<Child> = Vec::with_capacity(nodes as usize);
-    let mut ports: Vec<u16> = Vec::with_capacity(nodes as usize);
     for i in 0..nodes {
         let port = base_port + i;
         let addr = format!("{host}:{port}");
-        let child = Command::new(&exe)
-            .arg("run")
-            .arg("--addr")
-            .arg(&addr)
-            .kill_on_drop(true)
-            .spawn()?;
-        println!("  - node {i:02} -> {addr} (pid={})", child.id().unwrap_or(0));
-        children.push(child);
-        ports.push(port);
-    }
+        let mut cmd = Command::new(&exe);
+        cmd.arg("run").arg("--addr").arg(&addr);
 
-    // 2) Wait a bit + verify each port is listening
-    sleep(extra_wait).await;
-    for &port in &ports {
-        wait_until_listening(host, port, Duration::from_secs(3)).await?;
-    }
-
-    // 3) Wire the ring: i -> (i+1) % N
-    for (idx, &src_port) in ports.iter().enumerate() {
-        let next_port = ports[(idx + 1) % ports.len()];
-        send_set_next(host, src_port, host, next_port).await?;
-    }
-    println!("Ring stitched: {} nodes [{}…{}]", nodes, ports.first().unwrap(), ports.last().unwrap());
-
-    // 4) Optionally block until 'quit' or Ctrl-C, then kill children
-    if block {
-        println!("Type 'quit' + Enter or press Ctrl-C to stop all nodes…");
-        wait_for_quit_or_ctrl_c().await;
-    }
-
-    // 5) Cleanup
-    for mut child in children {
-        if let Err(e) = child.kill().await {
-            // It's fine if it's already gone
-            let _ = e;
+        #[cfg(unix)]
+        {
+            // Bring the extension trait into scope but silence "unused import" warnings.
+            use std::os::unix::process::CommandExt as _;
+            // Best-effort: make children share our process group.
+            // (If this API isn't available on your toolchain it's a no-op.)
+            let _ = cmd.process_group(0);
         }
+
+        let child = cmd.spawn()?;
+        children.push(child);
+        println!("spawned node on {addr}");
+    }
+
+    // 2) Give them a moment to bind (user-configurable cushion)
+    if extra_wait > Duration::from_millis(0) {
+        tokio::time::sleep(extra_wait).await;
+    }
+
+    // 3) Wait until all ports are listening (bounded wait)
+    for i in 0..nodes {
+        let port = base_port + i;
+        wait_until_listening(host, port, Duration::from_secs(5)).await?;
+        println!("node {host}:{port} is listening");
+    }
+
+    // 4) Wire the ring via SET_NEXT
+    for i in 0..nodes {
+        let this_port = base_port + i;
+        let next_port = if i + 1 == nodes {
+            base_port
+        } else {
+            base_port + i + 1
+        };
+        let this_addr = format!("{host}:{this_port}");
+        let next_addr = format!("{host}:{next_port}");
+        send_set_next(&this_addr, &next_addr).await?;
+        println!("wired {this_addr} -> {next_addr}");
+    }
+
+    println!("ring wired successfully.");
+
+    // 5) Optionally block until user quits / Ctrl-C
+    if block {
+        println!("type 'quit' or press Ctrl-C to stop…");
+        wait_for_quit_or_ctrl_c().await;
+        println!("stopping nodes…");
+    }
+
+    // 6) Cleanup
+    for mut child in children {
+        let _ = child.kill().await;
         let _ = child.wait().await;
     }
     Ok(())
@@ -181,24 +207,23 @@ async fn wait_until_listening(
     }
 }
 
-async fn send_set_next(
-    src_host: &str,
-    src_port: u16,
-    next_host: &str,
-    next_port: u16,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let src_addr = format!("{src_host}:{src_port}");
-    let next_addr = format!("{next_host}:{next_port}");
-    let mut s = TcpStream::connect(&src_addr).await?;
+async fn send_set_next(this_addr: &str, next_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut s = TcpStream::connect(this_addr).await?;
     let line = format!("SET_NEXT {next_addr}\n");
     s.write_all(line.as_bytes()).await?;
-    // Best-effort read small response (OK …), but we don't depend on it.
+
+    // Best-effort ACK: accept "OK" or "OK <anything>"
+    let mut reader = BufReader::new(s);
     let mut buf = String::new();
-    let mut r = BufReader::new(s);
-    // Don't hang: try reading one line with a tiny timeout.
-    let read = tokio::time::timeout(Duration::from_millis(150), r.read_line(&mut buf)).await;
+    let read = tokio::time::timeout(Duration::from_millis(150), reader.read_line(&mut buf)).await;
     if read.is_err() {
-        // ignore slow readers; wiring is fire-and-forget
+        // It's okay if the ACK races; we still consider wiring successful.
+        return Ok(());
+    }
+    let ack = buf.trim();
+    let upper = ack.to_ascii_uppercase();
+    if !(upper == "OK" || upper.starts_with("OK ")) {
+        return Err(format!("unexpected response to SET_NEXT from {this_addr}: {buf}").into());
     }
     Ok(())
 }
