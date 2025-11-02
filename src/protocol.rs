@@ -22,21 +22,39 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     // Core verbs
-    SetNext(String),                   // SET_NEXT <addr>
-    Get,                               // GET
-    Ring { ttl: u32, msg: String },    // RING <ttl> <message...>
+    SetNext(String), // SET_NEXT <addr>
+    Get,             // GET
+    Ring {
+        ttl: u32,
+        msg: String,
+    }, // RING <ttl> <message...>
 
     // WALK verbs
-    WalkStart,                                             // "WALK"
-    WalkHop { token: String, start_addr: String, history: String }, // "WALK HOP ..."
-    WalkDone { token: String, history: String },           // "WALK DONE ..."
+    WalkStart, // "WALK"
+    WalkHop {
+        token: String,
+        start_addr: String,
+        history: String,
+    }, // "WALK HOP ..."
+    WalkDone {
+        token: String,
+        history: String,
+    }, // "WALK DONE ..."
 
     // FILE verbs
-    PushFile { size: u64, name: String },                  // client -> start
-    FileHop { token: String, start_addr: String, size: u64, name: String }, // node -> node
+    PushFile {
+        size: u64,
+        name: String,
+    }, // client -> start
+    FileHop {
+        token: String,
+        start_addr: String,
+        size: u64,
+        name: String,
+    }, // node -> node
 
     // LIST (local)
-    ListFiles,                                             // "LIST_FILES"
+    ListFiles, // "LIST_FILES"
 }
 
 /// Parse one incoming line from the wire into a Command.
@@ -44,10 +62,8 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
 
     // SET_NEXT <addr>
-    if let Some(rest) = trimmed.strip_prefix("SET_NEXT ") {
-        let addr = rest.trim();
-        if addr.is_empty() { return Err("missing address".into()); }
-        return Ok(Command::SetNext(addr.to_string()));
+    if let Ok(cmd) = set_next(trimmed) {
+        return Ok(cmd);
     }
 
     // GET
@@ -56,12 +72,8 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     }
 
     // RING <ttl> <message...>
-    if let Some(rest) = trimmed.strip_prefix("RING ") {
-        let mut parts = rest.splitn(2, ' ');
-        let ttl_str = parts.next().unwrap_or("");
-        let msg = parts.next().unwrap_or("").trim().to_string();
-        let ttl = ttl_str.parse::<u32>().map_err(|_| "invalid ttl")?;
-        return Ok(Command::Ring { ttl, msg });
+    if let Ok(cmd) = ring(trimmed) {
+        return Ok(cmd);
     }
 
     // WALK
@@ -70,6 +82,56 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     }
 
     // WALK HOP <token> <start_addr> <history>
+    if let Ok(cmd) = walk_hop(trimmed) {
+        return Ok(cmd);
+    }
+
+    // WALK DONE <token> <history>
+    if let Ok(cmd) = walk_done(trimmed) {
+        return Ok(cmd);
+    }
+
+    // PUSH_FILE <size> <name>
+    if let Ok(cmd) = push_file(trimmed) {
+        return Ok(cmd);
+    }
+
+    // FILE HOP <token> <start_addr> <size> <name>
+    if let Ok(cmd) = file_hop(trimmed) {
+        return Ok(cmd);
+    }
+
+    // LIST_FILES
+    if trimmed == "LIST_FILES" {
+        return Ok(Command::ListFiles);
+    }
+
+    Err("unknown command".into())
+}
+
+fn set_next(trimmed: &str) -> Result<Command, String> {
+    if let Some(rest) = trimmed.strip_prefix("SET_NEXT ") {
+        let addr = rest.trim();
+        if addr.is_empty() {
+            return Err("missing address".into());
+        }
+        return Ok(Command::SetNext(addr.to_string()));
+    }
+    Err("wrong command".into())
+}
+
+fn ring(trimmed: &str) -> Result<Command, String> {
+    if let Some(rest) = trimmed.strip_prefix("RING ") {
+        let mut parts = rest.splitn(2, ' ');
+        let ttl_str = parts.next().unwrap_or("");
+        let msg = parts.next().unwrap_or("").trim().to_string();
+        let ttl = ttl_str.parse::<u32>().map_err(|_| "invalid ttl")?;
+        return Ok(Command::Ring { ttl, msg });
+    }
+    Err("wrong command".into())
+}
+
+fn walk_hop(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("WALK HOP ") {
         let mut parts = rest.splitn(3, ' ');
         let token = parts.next().unwrap_or("").trim();
@@ -84,8 +146,10 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             history,
         });
     }
+    Err("wrong command".into())
+}
 
-    // WALK DONE <token> <history>
+fn walk_done(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("WALK DONE ") {
         let mut parts = rest.splitn(2, ' ');
         let token = parts.next().unwrap_or("").trim();
@@ -93,20 +157,29 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
         if token.is_empty() {
             return Err("malformed WALK DONE".into());
         }
-        return Ok(Command::WalkDone { token: token.to_string(), history });
+        return Ok(Command::WalkDone {
+            token: token.to_string(),
+            history,
+        });
     }
+    Err("wrong command".into())
+}
 
-    // PUSH_FILE <size> <name>
+fn push_file(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("PUSH_FILE ") {
         let mut parts = rest.splitn(2, ' ');
         let size_str = parts.next().unwrap_or("").trim();
         let name = parts.next().unwrap_or("").to_string();
-        if name.is_empty() { return Err("missing file name".into()); }
+        if name.is_empty() {
+            return Err("missing file name".into());
+        }
         let size = size_str.parse::<u64>().map_err(|_| "invalid size")?;
         return Ok(Command::PushFile { size, name });
     }
+    Err("wrong command".into())
+}
 
-    // FILE HOP <token> <start_addr> <size> <name>
+fn file_hop(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("FILE HOP ") {
         let mut parts = rest.splitn(4, ' ');
         let token = parts.next().unwrap_or("").trim();
@@ -117,13 +190,12 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             return Err("malformed FILE HOP".into());
         }
         let size = size_str.parse::<u64>().map_err(|_| "invalid size")?;
-        return Ok(Command::FileHop { token: token.to_string(), start_addr: start_addr.to_string(), size, name });
+        return Ok(Command::FileHop {
+            token: token.to_string(),
+            start_addr: start_addr.to_string(),
+            size,
+            name,
+        });
     }
-
-    // LIST_FILES
-    if trimmed == "LIST_FILES" {
-        return Ok(Command::ListFiles);
-    }
-
-    Err("unknown command".into())
+    Err("wrong command".into())
 }

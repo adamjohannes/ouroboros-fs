@@ -128,8 +128,7 @@ async fn set_network(
 
         #[cfg(unix)]
         {
-            // Bring the extension trait into scope but silence "unused import" warnings.
-            use std::os::unix::process::CommandExt as _;
+            // use std::os::unix::process::CommandExt as _;
             // Best-effort: make children share our process group.
             // (If this API isn't available on your toolchain it's a no-op.)
             let _ = cmd.process_group(0);
