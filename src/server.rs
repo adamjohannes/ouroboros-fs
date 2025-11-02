@@ -1,4 +1,5 @@
 use std::{error, sync::Arc, time::Duration, path::PathBuf};
+use std::path::Path;
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader
@@ -312,6 +313,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let name = Path::new(&name).file_name().unwrap().to_str().unwrap();
     // Ensure we have a next hop (so the ring is valid)
     let Some(_next) = node.get_next().await else {
         writer.write_all(b"ERR no next hop set\n").await?;
