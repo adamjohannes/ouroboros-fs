@@ -1,5 +1,6 @@
-use std::{error, sync::Arc, time::Duration, path::PathBuf};
+use std::{error, sync::Arc, path::PathBuf};
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy
@@ -84,9 +85,9 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 Command::FilePipeHop { token, start_addr, file_size, parts, index, name } =>
                     handle_file_pipe_hop(&node, &mut reader, &mut writer, token, start_addr, file_size, parts, index, name).await?,
 
-                // LIST (local)
+                // LIST (now returns CSV from file_tags)
                 Command::ListFiles =>
-                    handle_list_files(&node, &mut writer).await?,
+                    handle_list_files_csv(&node, &mut writer).await?,
             },
             Err(e) => handle_error(&mut writer, e).await?,
         }
@@ -478,19 +479,24 @@ where
 
 /* -------- LIST_FILES: local-only listing -------- */
 
-async fn handle_list_files<W: AsyncWrite + Unpin>(
+async fn handle_list_files_csv<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
-    let files = list_local_files(node).await?;
-    if files.is_empty() {
-        writer.write_all(b"(empty)\n").await?;
-    } else {
-        for f in files {
-            writer.write_all(format!("{}\n", f).as_bytes()).await?;
-        }
+    // We output *pure CSV* (header + rows). No trailing "OK" so the output is a valid CSV file.
+    writer.write_all(b"name,start,size\n").await?;
+
+    let tags = node.file_tags.read().await;
+    let mut items: Vec<(&String, &crate::node::FileTag)> = tags.iter().collect();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (name, tag) in items {
+        let name_escaped = csv_escape(name);
+        writer
+            .write_all(format!("{},{},{}\n", name_escaped, tag.start, tag.size).as_bytes())
+            .await?;
     }
-    writer.write_all(b"OK\n").await?;
+
     Ok(())
 }
 
@@ -517,28 +523,20 @@ async fn save_into_node_dir(node: &Node, name: &str, data: &[u8]) -> Result<Path
     Ok(path)
 }
 
-async fn list_local_files(node: &Node) -> Result<Vec<String>, AnyErr> {
-    let dir = format!("nodes/{}", port_str(&node.port));
-    let mut out = Vec::new();
-    let mut rd = match fs::read_dir(&dir).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[{}] read_dir {} failed: {}", node.port, dir, e);
-            return Ok(out);
-        }
-    };
-
-    while let Ok(Some(ent)) = rd.next_entry().await {
-        let ty = ent.file_type().await;
-        if let Ok(t) = ty {
-            if t.is_file() {
-                if let Some(name) = ent.file_name().to_str() {
-                    out.push(name.to_string());
-                }
-            }
-        }
+/// Minimal CSV escaping for names containing commas, quotes, or newlines.
+fn csv_escape(s: &str) -> String {
+    let needs_quotes = s.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r'));
+    if !needs_quotes {
+        return s.to_string();
     }
-
-    out.sort_unstable();
-    Ok(out)
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"'); // escape by doubling
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
 }
