@@ -138,7 +138,7 @@ fn walk(trimmed: &str) -> Result<Command, String> {
     }
     if let Ok(cmd) = walk_hop(trimmed) { return Ok(cmd); }
     if let Ok(cmd) = walk_done(trimmed) { return Ok(cmd); }
-    return Err("wrong command".into());
+    Err("wrong command".into())
 }
 
 fn walk_hop(trimmed: &str) -> Result<Command, String> {
@@ -187,7 +187,7 @@ fn investigate(trimmed: &str) -> Result<Command, String> {
     if trimmed.eq_ignore_ascii_case("NETMAP GET") {
         return Ok(Command::NetmapGet);
     }
-    return Err("wrong command".into());
+    Err("wrong command".into())
 }
 
 fn invest_hop(trimmed: &str) -> Result<Command, String> {
