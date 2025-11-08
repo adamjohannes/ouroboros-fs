@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 # Detect OS to set correct netcat options
-# Linux (Arch) uses `nc -q 0` to close connection after EOF
-# macOS/BSD uses `nc -c` for the same behavior
+# Linux (Arch) uses `nc -q 0`
+# macOS/BSD uses `nc -w 1`
 NC_OPTS="-q 0" # Default for Linux
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  NC_OPTS="-c"
+  NC_OPTS="-w 1"
 fi
 
 # Check if a file name was provided
@@ -19,6 +19,4 @@ fi
 FILE_NAME="$1";
 
 # Send the FILE PULL command.
-# The server responds with the raw file bytes, which
-# are printed directly to stdout.
 printf "FILE PULL ${FILE_NAME}\n" | nc ${NC_OPTS} 127.0.0.1 7000
