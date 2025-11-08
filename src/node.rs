@@ -25,10 +25,10 @@ pub struct FileTag {
 /// - FILE push also uses token->oneshot at the start node (to confirm loop).
 #[derive(Debug)]
 pub struct Node {
-    /// Where this node is listening (e.g. "127.0.0.1:7001")
+    /// Where this node is listening
     pub port: String,
 
-    /// Address of the next node in the ring; None until set via SET_NEXT
+    /// Address of the next node in the ring, one until set via NODE NEXT
     pub next_port: RwLock<Option<String>>,
 
     // WALK pending acks (start node only)
@@ -70,14 +70,14 @@ impl Node {
         self.next_port.read().await.clone()
     }
 
-    pub async fn forward_ring(
+    pub async fn forward_ring_forward(
         &self,
         ttl: u32,
         msg: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let line = format!("RING {} {}\n", ttl, msg);
+            let line = format!("RING FORWARD {} {}\\n", ttl, msg);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
@@ -92,7 +92,7 @@ impl Node {
         );
     }
 
-    /* ---------------- WALK helpers ---------------- */
+    /* ---------------- TOPOLOGY (WALK) helpers ---------------- */
 
     fn next_token(&self) -> String {
         let n = self.walk_counter.fetch_add(1, Ordering::Relaxed);
@@ -112,7 +112,7 @@ impl Node {
         rx
     }
 
-    pub async fn forward_walk_hop(
+    pub async fn forward_topology_hop(
         &self,
         token: &str,
         start_addr: &str,
@@ -120,7 +120,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let line = format!("WALK HOP {} {} {}\n", token, start_addr, history);
+            let line = format!("TOPOLOGY HOP {} {} {}\\n", token, start_addr, history);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
@@ -135,14 +135,14 @@ impl Node {
         }
     }
 
-    pub async fn send_walk_done(
+    pub async fn send_topology_done(
         &self,
         start_addr: &str,
         token: &str,
         history: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
-        let line = format!("WALK DONE {} {}\n", token, history);
+        let line = format!("TOPOLOGY DONE {} {}\\n", token, history);
         s.write_all(line.as_bytes()).await?;
         Ok(())
     }
@@ -176,7 +176,7 @@ impl Node {
         }
     }
 
-    pub async fn forward_file_hop(
+    pub async fn forward_file_relay_blob(
         &self,
         token: &str,
         start_addr: &str,
@@ -186,7 +186,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let header = format!("FILE HOP {} {} {} {}\n", token, start_addr, size, name);
+            let header = format!("FILE RELAY-BLOB {} {} {} {}\\n", token, start_addr, size, name);
             s.write_all(header.as_bytes()).await?;
             s.write_all(data).await?;
         }
@@ -220,7 +220,7 @@ impl Node {
     }
 }
 
-/* ---------- INVESTIGATION helpers & netmap ---------- */
+/* ---------- NETMAP (INVESTIGATION) helpers ---------- */
 
 fn host_str(addr: &str) -> &str {
     addr.split(':').next().unwrap_or("127.0.0.1")
@@ -268,7 +268,6 @@ fn serialize_entries(map: &HashMap<String, NodeStatus>) -> String {
 
 impl Node {
     pub fn make_invest_token(&self) -> String {
-        // Reuse the monotonic counter; only uniqueness matters
         self.next_token()
     }
 
@@ -283,13 +282,13 @@ impl Node {
         *self.network_nodes.write().await = map;
     }
 
-    /// NEW: quick count of known nodes (>=1)
+    /// Quick count of known nodes (>=1)
     pub async fn network_size(&self) -> usize {
         let n = self.network_nodes.read().await.len();
         if n == 0 { 1 } else { n }
     }
 
-    /// NEW: Human-friendly lines for "NETMAP GET"
+    /// Human-friendly lines for "NETMAP GET"
     pub async fn get_network_nodes_lines(&self) -> Vec<String> {
         let map = self.network_nodes.read().await;
         let mut keys: Vec<_> = map.keys().cloned().collect();
@@ -299,7 +298,7 @@ impl Node {
             .collect()
     }
 
-    pub async fn forward_invest_hop(
+    pub async fn forward_netmap_hop(
         &self,
         token: &str,
         start_addr: &str,
@@ -307,20 +306,20 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let line = format!("INVEST HOP {} {} {}\n", token, start_addr, entries);
+            let line = format!("NETMAP HOP {} {} {}\\n", token, start_addr, entries);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
     }
 
-    pub async fn send_invest_done(
+    pub async fn send_netmap_done(
         &self,
         start_addr: &str,
         token: &str,
         entries: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
-        let line = format!("INVEST DONE {} {}\n", token, entries);
+        let line = format!("NETMAP DONE {} {}\\n", token, entries);
         s.write_all(line.as_bytes()).await?;
         Ok(())
     }
@@ -331,7 +330,7 @@ impl Node {
         for port in map.keys() {
             let addr = format!("{}:{}", host, port);
             if let Ok(mut s) = TcpStream::connect(&addr).await {
-                let line = format!("NETMAP SET {}\n", entries);
+                let line = format!("NETMAP SET {}\\n", entries);
                 let _ = s.write_all(line.as_bytes()).await;
             }
         }
