@@ -97,7 +97,10 @@ impl Node {
     pub async fn set_file_tag(&self, name: &str, start_port: u16, size: u64) {
         self.file_tags.write().await.insert(
             name.to_string(),
-            FileTag { start: start_port, size }
+            FileTag {
+                start: start_port,
+                size,
+            },
         );
     }
 
@@ -229,7 +232,10 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let header = format!("FILE RELAY-BLOB {} {} {} {}\n", token, start_addr, size, name);
+            let header = format!(
+                "FILE RELAY-BLOB {} {} {} {}\n",
+                token, start_addr, size, name
+            );
             s.write_all(header.as_bytes()).await?;
             s.write_all(data).await?;
         }
@@ -297,7 +303,9 @@ fn serialize_entries(map: &HashMap<String, NodeStatus>) -> String {
     keys.sort_unstable();
     let mut out = String::new();
     for (i, k) in keys.iter().enumerate() {
-        if i > 0 { out.push(','); }
+        if i > 0 {
+            out.push(',');
+        }
         out.push_str(k);
         out.push('=');
         out.push_str(match map.get(k) {
@@ -337,7 +345,13 @@ impl Node {
         let mut keys: Vec<_> = map.keys().cloned().collect();
         keys.sort_unstable();
         keys.into_iter()
-            .map(|k| format!("{}={:?}", k, map.get(&k).cloned().unwrap_or(NodeStatus::Alive)))
+            .map(|k| {
+                format!(
+                    "{}={:?}",
+                    k,
+                    map.get(&k).cloned().unwrap_or(NodeStatus::Alive)
+                )
+            })
             .collect()
     }
 
@@ -372,7 +386,9 @@ impl Node {
         let host = host_str(&self.port).to_string();
         for port in map.keys() {
             let addr = format!("{}:{}", host, port);
-            if addr == self.port { continue; } // Don't broadcast to self
+            if addr == self.port {
+                continue;
+            } // Don't broadcast to self
             if let Ok(mut s) = TcpStream::connect(&addr).await {
                 let line = format!("NETMAP SET {}\n", entries);
                 let _ = s.write_all(line.as_bytes()).await;
@@ -433,7 +449,9 @@ impl Node {
         println!("[{}] Broadcasting topology: {}", self.port, history);
         for port in map.keys() {
             let addr = format!("{}:{}", host, port);
-            if addr == self.port { continue; }
+            if addr == self.port {
+                continue;
+            }
             if let Ok(mut s) = TcpStream::connect(&addr).await {
                 let line = format!("TOPOLOGY SET {}\n", history);
                 let _ = s.write_all(line.as_bytes()).await;

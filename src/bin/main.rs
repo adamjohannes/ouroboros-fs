@@ -61,7 +61,11 @@ enum Cmd {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Run { addr, port, wait_time } => {
+        Cmd::Run {
+            addr,
+            port,
+            wait_time,
+        } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
             run(&bind, gossip_interval).await
@@ -82,7 +86,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Duration::from_millis(wait_ms),
                 wait_time,
             )
-                .await
+            .await
         }
     }
 }
@@ -210,7 +214,6 @@ async fn set_network(
     } else {
         println!("started topology walk from {start_addr}");
     }
-
 
     // 7. Optionally block until user quits / Ctrl-C
     if block {
