@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -44,10 +45,16 @@ pub struct Node {
 
     /// Mapping of file name -> (start port, size)
     pub file_tags: RwLock<HashMap<String, FileTag>>,
+
+    /// Time between gossip health checks
+    pub gossip_interval: Duration,
+
+    /// Map of `port -> next_port` for the entire ring
+    pub topology_map: RwLock<HashMap<String, String>>,
 }
 
 impl Node {
-    pub fn new(port: String) -> Arc<Self> {
+    pub fn new(port: String, gossip_interval: Duration) -> Arc<Self> {
         let network_nodes = RwLock::new(HashMap::new());
 
         Arc::new(Self {
@@ -59,6 +66,8 @@ impl Node {
             file_counter: AtomicU64::new(1),
             network_nodes,
             file_tags: RwLock::new(HashMap::new()),
+            gossip_interval,
+            topology_map: RwLock::new(HashMap::new()),
         })
     }
 
@@ -77,7 +86,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let line = format!("RING FORWARD {} {}\\n", ttl, msg);
+            let line = format!("RING FORWARD {} {}\n", ttl, msg);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
@@ -90,6 +99,40 @@ impl Node {
             name.to_string(),
             FileTag { start: start_port, size }
         );
+    }
+
+    /// Serializes file tags into a single line: `name1:start1:size1;name2:start2:size2`
+    pub async fn get_file_tags_entries(&self) -> String {
+        let tags = self.file_tags.read().await;
+        let mut items: Vec<(&String, &FileTag)> = tags.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+
+        items
+            .into_iter()
+            .map(|(name, tag)| {
+                // Replace special chars in name to avoid parsing errors
+                let safe_name = name.replace(':', "_").replace(';', "_");
+                format!("{}:{}:{}", safe_name, tag.start, tag.size)
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Parses file tags from a single line: `name1:start1:size1;name2:start2:size2`
+    pub async fn set_file_tags_from_entries(&self, entries: &str) {
+        let mut tags = self.file_tags.write().await;
+        tags.clear();
+        for entry in entries.split(';').filter(|s| !s.is_empty()) {
+            let parts: Vec<_> = entry.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                let name = parts[0];
+                let start_res = parts[1].parse::<u16>();
+                let size_res = parts[2].parse::<u64>();
+                if let (Ok(start), Ok(size)) = (start_res, size_res) {
+                    tags.insert(name.to_string(), FileTag { start, size });
+                }
+            }
+        }
     }
 
     /* ---------------- TOPOLOGY (WALK) helpers ---------------- */
@@ -120,7 +163,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let line = format!("TOPOLOGY HOP {} {} {}\\n", token, start_addr, history);
+            let line = format!("TOPOLOGY HOP {} {} {}\n", token, start_addr, history);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
@@ -142,7 +185,7 @@ impl Node {
         history: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
-        let line = format!("TOPOLOGY DONE {} {}\\n", token, history);
+        let line = format!("TOPOLOGY DONE {} {}\n", token, history);
         s.write_all(line.as_bytes()).await?;
         Ok(())
     }
@@ -186,7 +229,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let header = format!("FILE RELAY-BLOB {} {} {} {}\\n", token, start_addr, size, name);
+            let header = format!("FILE RELAY-BLOB {} {} {} {}\n", token, start_addr, size, name);
             s.write_all(header.as_bytes()).await?;
             s.write_all(data).await?;
         }
@@ -306,7 +349,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let line = format!("NETMAP HOP {} {} {}\\n", token, start_addr, entries);
+            let line = format!("NETMAP HOP {} {} {}\n", token, start_addr, entries);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
@@ -319,7 +362,7 @@ impl Node {
         entries: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
-        let line = format!("NETMAP DONE {} {}\\n", token, entries);
+        let line = format!("NETMAP DONE {} {}\n", token, entries);
         s.write_all(line.as_bytes()).await?;
         Ok(())
     }
@@ -329,10 +372,77 @@ impl Node {
         let host = host_str(&self.port).to_string();
         for port in map.keys() {
             let addr = format!("{}:{}", host, port);
+            if addr == self.port { continue; } // Don't broadcast to self
             if let Ok(mut s) = TcpStream::connect(&addr).await {
-                let line = format!("NETMAP SET {}\\n", entries);
+                let line = format!("NETMAP SET {}\n", entries);
                 let _ = s.write_all(line.as_bytes()).await;
             }
         }
+    }
+}
+
+/* ---------- Gossip/Topology helpers ---------- */
+impl Node {
+    pub async fn update_node_status(&self, port: String, status: NodeStatus) {
+        self.network_nodes.write().await.insert(port, status);
+    }
+
+    pub async fn get_network_nodes_entries(&self) -> String {
+        let map = self.network_nodes.read().await;
+        serialize_entries(&map)
+    }
+
+    /// Gets current netmap entries and broadcasts them
+    pub async fn broadcast_netmap_update(&self) {
+        let entries = self.get_network_nodes_entries().await;
+        self.broadcast_netmap(&entries).await;
+    }
+
+    /// Parses "7000->7001;7001->7002" and stores it
+    pub async fn set_topology_from_history(&self, history: &str) {
+        let mut map = self.topology_map.write().await;
+        map.clear();
+        for edge in history.split(';').filter(|s| !s.is_empty()) {
+            if let Some((from, to)) = edge.split_once("->") {
+                map.insert(from.to_string(), to.to_string());
+            }
+        }
+        println!("[{}] Topology map updated", self.port);
+    }
+
+    /// Serializes topology map back to "7000->7001;7001->7002"
+    pub async fn get_topology_history(&self) -> String {
+        let map = self.topology_map.read().await;
+        let mut keys: Vec<_> = map.keys().cloned().collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .map(|k| format!("{}->{}", k, map.get(&k).unwrap_or(&"".to_string())))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Broadcasts the full topology map to all nodes
+    pub async fn broadcast_topology_set(&self) {
+        let history = self.get_topology_history().await;
+        if history.is_empty() {
+            return;
+        }
+
+        let map = self.network_nodes.read().await;
+        let host = host_str(&self.port).to_string();
+        println!("[{}] Broadcasting topology: {}", self.port, history);
+        for port in map.keys() {
+            let addr = format!("{}:{}", host, port);
+            if addr == self.port { continue; }
+            if let Ok(mut s) = TcpStream::connect(&addr).await {
+                let line = format!("TOPOLOGY SET {}\n", history);
+                let _ = s.write_all(line.as_bytes()).await;
+            }
+        }
+    }
+
+    /// Finds the next hop for a *specific node* from the stored topology
+    pub async fn get_next_for_node(&self, port: &str) -> Option<String> {
+        self.topology_map.read().await.get(port).cloned()
     }
 }
