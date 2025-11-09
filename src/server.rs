@@ -219,7 +219,10 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                     handle_file_notify_chunk_saved(Arc::clone(&node), &mut writer, name).await?
                 }
                 protocol::Command::FileGetChunkForBackup { name } => {
-                    handle_file_get_chunk_for_backup(&node, &mut writer, name).await?;
+                    handle_file_get_chunk_for_backup(&node, &mut writer, name).await?
+                }
+                protocol::Command::FileGetBackupChunk { name } => {
+                    handle_file_get_backup_chunk(&node, &mut writer, name).await?
                 }
             },
             Err(e) => handle_error(&mut writer, e).await?,
@@ -555,9 +558,9 @@ where
     // Determine how many parts to split into: number of known nodes (fallback to 1)
     let parts: u32 = node.network_size().await as u32;
 
-    // Update local file_tags (start, size)
+    // Update local file_tags (start, size, parts)
     let start_port_num: u16 = port_str(&node.port).parse().unwrap_or(0);
-    node.set_file_tag(&name, start_port_num, size).await;
+    node.set_file_tag(&name, start_port_num, size, parts).await;
 
     if parts == 1 {
         // Single node: read everything and store locally
@@ -714,7 +717,8 @@ where
 
     // Tag the file on this node too
     let start_port_num: u16 = port_str(&start_addr).parse().unwrap_or(0);
-    node.set_file_tag(&name, start_port_num, file_size).await;
+    node.set_file_tag(&name, start_port_num, file_size, parts)
+        .await;
 
     // Save my chunk locally
     let chunk_name = chunk_file_name(&name, index, parts);
@@ -786,11 +790,13 @@ async fn handle_file_pull<W: AsyncWrite + Unpin>(
         return Ok(());
     };
     let start_port = tag.start;
+    let parts = tag.parts;
+    let file_size = tag.size;
     let start_addr = format!("{}:{}", host_of(&node.port), start_port);
     drop(tags);
 
     // Assemble full file by walking the ring starting at start_addr
-    let bytes = pull_file_from_ring(node, &name, &start_addr).await?;
+    let bytes = pull_file_from_ring(node, &name, &start_addr, parts, file_size).await?;
 
     // IMPORTANT: return *pure bytes*, no textual header or trailer.
     writer.write_all(&bytes).await?;
@@ -803,9 +809,15 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
     name: String,
 ) -> Result<(), AnyErr> {
     let next = node.get_next().await.unwrap_or_else(|| node.port.clone());
-    let chunk = read_local_chunk_bytes(node, &name, "content")
-        .await
-        .unwrap_or_default();
+
+    // Read the specific chunk from the "content" directory
+    let chunk_path = PathBuf::from(format!(
+        "nodes/{}/content/{}",
+        port_str(&node.port),
+        sanitize_filename(&name)
+    ));
+
+    let chunk = fs::read(&chunk_path).await.unwrap_or_default();
 
     // Header + exact bytes for node-to-node transfer
     writer
@@ -934,50 +946,208 @@ async fn handle_file_get_chunk_for_backup<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Handles "FILE GET-BACKUP-CHUNK <name>"
+/// This is used by the PULL failover process. It reads from the "/backup" dir
+/// and returns a standard FILE RESP-CHUNK.
+async fn handle_file_get_backup_chunk<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    name: String,
+) -> Result<(), AnyErr> {
+    let next = node.get_next().await.unwrap_or_else(|| node.port.clone());
+
+    // Read from "backup" directory
+    let chunk_path = PathBuf::from(format!(
+        "nodes/{}/backup/{}",
+        port_str(&node.port),
+        sanitize_filename(&name)
+    ));
+
+    let chunk = fs::read(&chunk_path).await.unwrap_or_default();
+
+    // Respond with the same protocol message as GET-CHUNK
+    writer
+        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, chunk.len(), name).as_bytes())
+        .await?;
+    writer.write_all(&chunk).await?;
+    Ok(())
+}
+
 /* --- PULL helpers --- */
 
-async fn pull_file_from_ring(node: &Node, name: &str, start_addr: &str) -> Result<Vec<u8>, AnyErr> {
-    let start_port = port_str(start_addr).to_string();
+async fn pull_file_from_ring(
+    node: &Node,
+    name: &str,
+    start_addr: &str,
+    parts: u32,
+    _file_size: u64,
+) -> Result<Vec<u8>, AnyErr> {
     let mut out = Vec::new();
+    let mut current_addr = start_addr.to_string();
+    let mut current_port = port_str(start_addr).to_string();
+    let host = host_of(start_addr);
+    let topology = node.topology_map.read().await;
 
-    let mut current = start_addr.to_string();
+    for i in 0..parts {
+        let chunk_name = chunk_file_name(name, i, parts);
+        let chunk: Vec<u8>;
 
-    loop {
-        let curr_port = port_str(&current).to_string();
+        // 1. Try to get chunk from the current node
+        match request_chunk_from(&current_addr, &chunk_name).await {
+            Ok((chunk_data, _next_addr_ignored)) => {
+                // Node is alive.
+                tracing::debug!(
+                    node = %node.port,
+                    from = %current_addr,
+                    chunk_name = %chunk_name,
+                    "Got chunk successfully."
+                );
+                chunk = chunk_data;
+            }
+            Err(e) => {
+                // 1.2. Node is likely dead
+                tracing::warn!(
+                    node = %node.port,
+                    target_node = %current_addr,
+                    chunk_name = %chunk_name,
+                    error = ?e,
+                    "Failed to get chunk from node. Attempting to use backup."
+                );
 
-        // Fetch chunk from `current` (local fast-path)
-        let (chunk, next_addr) = if curr_port == port_str(&node.port) {
-            let bytes = read_local_chunk_bytes(node, name, "content")
-                .await
-                .unwrap_or_default();
-            let next = node.get_next().await.unwrap_or_else(|| current.clone());
-            (bytes, next)
-        } else {
-            request_chunk_from(&current, name).await?
-        };
+                // Mark node as Dead and broadcast this change
+                tracing::info!(
+                    node = %node.port,
+                    dead_node = %current_port,
+                    "Marking node as Dead and broadcasting netmap update."
+                );
+                node.update_node_status(current_port.clone(), crate::NodeStatus::Dead)
+                    .await;
+
+                // Await the broadcast to ensure state is sent before we continue
+                node.broadcast_netmap_update().await;
+
+                // 1.3. Find the predecessor of the dead node (the one holding the backup)
+                let pred_port = topology
+                    .iter()
+                    .find(|(_from, to)| port_str(to) == current_port)
+                    .map(|(from, _to)| from.clone());
+
+                let Some(pred_port) = pred_port else {
+                    tracing::error!(
+                        node = %node.port,
+                        dead_node = %current_addr,
+                        "No predecessor found in topology for dead node. Cannot fetch backup."
+                    );
+                    chunk = Vec::new();
+                    out.extend_from_slice(&chunk);
+
+                    // Manually advance to the next node to avoid getting stuck
+                    let next_port = topology.get(&current_port).cloned();
+                    if let Some(port) = next_port {
+                        current_port = port.clone();
+                        current_addr = format!("{}:{}", host, port);
+                    } else {
+                        tracing::error!(node=%node.port, dead_node=%current_port, "Topology broken. Cannot find next hop.");
+                        break;
+                    }
+                    continue;
+                };
+
+                let pred_addr = format!("{}:{}", host, pred_port);
+
+                // 1.4. Request the backup chunk from the predecessor
+                match request_backup_chunk_from(&pred_addr, &chunk_name).await {
+                    Ok((chunk_data, _)) => {
+                        tracing::info!(
+                            node = %node.port,
+                            from_backup_node = %pred_addr,
+                            chunk_name = %chunk_name,
+                            "Successfully retrieved chunk from backup."
+                        );
+                        chunk = chunk_data;
+                    }
+                    Err(e_backup) => {
+                        tracing::error!(
+                            node = %node.port,
+                            backup_node = %pred_addr,
+                            chunk_name = %chunk_name,
+                            error = ?e_backup,
+                            "Failed to get chunk from backup node. File will be corrupt."
+                        );
+                        chunk = Vec::new();
+                    }
+                }
+            }
+        }
 
         out.extend_from_slice(&chunk);
 
-        // Decide whether to continue
-        if port_str(&next_addr) == start_port {
+        // 2. Find the next node in the chain to query
+        let next_port = topology.get(&current_port).cloned();
+
+        if let Some(port) = next_port {
+            current_port = port.clone();
+            current_addr = format!("{}:{}", host, port);
+        } else {
+            // This should only happen if the topology is broken
+            tracing::error!(
+                node = %node.port,
+                from_node = %current_port,
+                "Topology map is broken. Cannot find next hop. Stopping pull."
+            );
             break;
         }
-        current = next_addr;
     }
 
     Ok(out)
 }
 
-async fn request_chunk_from(addr: &str, name: &str) -> Result<(Vec<u8>, String), AnyErr> {
+async fn request_chunk_from(addr: &str, chunk_name: &str) -> Result<(Vec<u8>, String), AnyErr> {
     let mut s = TcpStream::connect(addr).await?;
-    s.write_all(format!("FILE GET-CHUNK {}\n", name).as_bytes())
+    s.write_all(format!("FILE GET-CHUNK {}\n", chunk_name).as_bytes())
         .await?;
 
     let (r, mut w) = s.into_split();
     let mut reader = BufReader::new(r);
 
-    // Parse: FILE RESP-CHUNK <next_addr> <size> <name>
+    // Parse FILE RESP-CHUNK <next_addr> <size> <name>
+    let mut header = String::new();
+    reader.read_line(&mut header).await?;
+    let header = header.trim_end_matches(['\r', '\n']);
 
+    let rest = header
+        .strip_prefix("FILE RESP-CHUNK ")
+        .ok_or_else(|| "malformed FILE RESP-CHUNK".to_string())?;
+    let mut parts = rest.splitn(3, ' ');
+    let next_addr = parts.next().unwrap_or("").to_string();
+    let size_str = parts.next().unwrap_or("");
+    let _name_echo = parts.next().unwrap_or("").to_string();
+
+    let size: usize = size_str
+        .parse()
+        .map_err(|_| "invalid chunk size".to_string())?;
+    let mut buf = vec![0u8; size];
+    reader.read_exact(&mut buf).await?;
+
+    // Ensure the is writer not dropped too early
+    let _ = (&mut w).shutdown().await;
+
+    Ok((buf, next_addr))
+}
+
+async fn request_backup_chunk_from(
+    addr: &str,
+    chunk_name: &str,
+) -> Result<(Vec<u8>, String), AnyErr> {
+    let mut s = TcpStream::connect(addr).await?;
+    // Send the new command
+    s.write_all(format!("FILE GET-BACKUP-CHUNK {}\n", chunk_name).as_bytes())
+        .await?;
+
+    let (r, mut w) = s.into_split();
+    let mut reader = BufReader::new(r);
+
+    // Parse FILE RESP-CHUNK <next_addr> <size> <name>
     let mut header = String::new();
     reader.read_line(&mut header).await?;
     let header = header.trim_end_matches(['\r', '\n']);
@@ -1000,27 +1170,6 @@ async fn request_chunk_from(addr: &str, name: &str) -> Result<(Vec<u8>, String),
     let _ = (&mut w).shutdown().await;
 
     Ok((buf, next_addr))
-}
-
-async fn read_local_chunk_bytes(node: &Node, name: &str, subdir: &str) -> Result<Vec<u8>, AnyErr> {
-    // Look for "<name>.part-*-of-*" inside nodes/<port>/<subdir>/
-    let dir = format!("nodes/{}/{}", port_str(&node.port), subdir);
-    let safe_prefix = format!("{}.", sanitize_filename(name));
-
-    let mut rd = fs::read_dir(&dir).await?;
-    while let Some(ent) = rd.next_entry().await? {
-        let ft = ent.file_type().await?;
-        if !ft.is_file() {
-            continue;
-        }
-        let fname = ent.file_name();
-        let fname = fname.to_string_lossy();
-        if fname.starts_with(&safe_prefix) && fname.contains(".part-") && fname.contains("-of-") {
-            let path = ent.path();
-            return Ok(fs::read(path).await?);
-        }
-    }
-    Ok(Vec::new())
 }
 
 /* -------- FILE LIST -------- */
