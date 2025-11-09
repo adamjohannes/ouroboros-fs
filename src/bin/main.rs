@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     fmt()
         .with_timer(fmt::time::UtcTime::rfc_3339()) // Adds RFC 3339 timestamps
         .with_env_filter(EnvFilter::from_default_env()) // Use RUST_LOG env var
-        .with_target(false) // Hides module paths for cleaner logs
+        .with_target(true)
         .init();
 
     let cli = Cli::parse();
