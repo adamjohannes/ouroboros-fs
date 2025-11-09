@@ -8,6 +8,7 @@ use tokio::{
     process::{Child, Command},
     time::sleep,
 };
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +61,13 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Initialize tracing subscriber
+    fmt()
+        .with_timer(fmt::time::UtcTime::rfc_3339()) // Adds RFC 3339 timestamps
+        .with_env_filter(EnvFilter::from_default_env()) // Use RUST_LOG env var
+        .with_target(false) // Hides module paths for cleaner logs
+        .init();
+
     let cli = Cli::parse();
     match cli.command {
         Cmd::Run {
@@ -132,7 +140,7 @@ async fn set_network(
     wait_time: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if nodes == 0 {
-        eprintln!("--nodes must be >= 1");
+        tracing::warn!("--nodes must be >= 1");
         return Ok(());
     }
 
@@ -143,12 +151,12 @@ async fn set_network(
     #[cfg(unix)]
     unsafe {
         if libc::setpgid(0, 0) == -1 {
-            eprintln!(
-                "Warning: could not set process group: {}",
-                std::io::Error::last_os_error()
+            tracing::warn!(
+                error = ?std::io::Error::last_os_error(),
+                "Could not set process group"
             );
         } else {
-            println!("Process group leader set with PGID {pgid}");
+            tracing::info!(pgid = %pgid, "Process group leader set");
         }
     }
 
@@ -160,10 +168,13 @@ async fn set_network(
     fs::create_dir_all(nodes_root)?;
 
     let exe = current_exe()?;
-    println!(
-        "starting {nodes} nodes at {host}:{base_port}..{} (exe: {:?})",
-        base_port + nodes - 1,
-        exe
+    tracing::info!(
+        nodes,
+        host,
+        base_port,
+        end_port = base_port + nodes - 1,
+        exe = ?exe,
+        "Starting network"
     );
 
     // 1. Spawn children
@@ -180,7 +191,7 @@ async fn set_network(
 
         let child = cmd.spawn()?;
         children.push(child);
-        println!("spawned node on {addr}");
+        tracing::info!(addr = %addr, "Spawned node");
     }
 
     // 2. Give nodes a moment to bind
@@ -192,7 +203,7 @@ async fn set_network(
     for i in 0..nodes {
         let port = base_port + i;
         wait_until_listening(host, port, Duration::from_secs(5)).await?;
-        println!("node {host}:{port} is listening");
+        tracing::info!(host, port, "Node is listening");
     }
 
     // 4. Wire the ring
@@ -206,37 +217,37 @@ async fn set_network(
         let this_addr = format!("{host}:{this_port}");
         let next_addr = format!("{host}:{next_port}");
         send_node_next(&this_addr, &next_addr).await?;
-        println!("wired {this_addr} -> {next_addr}");
+        tracing::info!(from = %this_addr, to = %next_addr, "Wired node");
     }
 
-    println!("ring wired successfully.");
+    tracing::info!("Ring wired successfully.");
 
     // 5. Start a full investigation from the first node
     let start_addr = format!("{host}:{base_port}");
     if let Err(e) = send_netmap_discover(&start_addr).await {
-        eprintln!("failed to start investigation from {start_addr}: {e}");
+        tracing::warn!(start_addr = %start_addr, error = ?e, "Failed to start netmap discover");
     } else {
-        println!("started full investigation from {start_addr}");
+        tracing::info!(start_addr = %start_addr, "Started netmap discover");
     }
 
     // 6. Start a topology walk to populate topology maps
     if let Err(e) = send_topology_walk(&start_addr).await {
-        eprintln!("failed to start topology walk from {start_addr}: {e}");
+        tracing::warn!(start_addr = %start_addr, error = ?e, "Failed to start topology walk");
     } else {
-        println!("started topology walk from {start_addr}");
+        tracing::info!(start_addr = %start_addr, "Started topology walk");
     }
 
     // 7. Optionally block until user quits / Ctrl-C
     if block {
-        println!("type 'quit' or press Ctrl-C to stop…");
+        tracing::info!("Type 'quit' or press Ctrl-C to stop…");
         wait_for_quit_or_ctrl_c().await;
-        println!("stopping nodes…");
+        tracing::info!("Stopping nodes…");
     }
 
     // 8. Cleanup
     #[cfg(unix)]
     {
-        println!("Stopping process group {pgid}...");
+        tracing::info!(pgid = %pgid, "Stopping process group");
         // Send SIGTERM to the entire process group
         unsafe {
             libc::kill(-(pgid as i32), libc::SIGTERM);

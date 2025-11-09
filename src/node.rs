@@ -12,6 +12,7 @@ use tokio::{
     net::TcpStream,
     sync::{RwLock, oneshot},
 };
+use tracing;
 
 #[derive(Debug, Clone)]
 pub struct FileTag {
@@ -423,7 +424,7 @@ impl Node {
                 map.insert(from.to_string(), to.to_string());
             }
         }
-        println!("[{}] Topology map updated", self.port);
+        tracing::debug!(node = %self.port, "Topology map updated");
     }
 
     /// Serializes topology map back to "7000->7001;7001->7002"
@@ -446,7 +447,7 @@ impl Node {
 
         let map = self.network_nodes.read().await;
         let host = host_str(&self.port).to_string();
-        println!("[{}] Broadcasting topology: {}", self.port, history);
+        tracing::debug!(node = %self.port, history = %history, "Broadcasting topology");
         for port in map.keys() {
             let addr = format!("{}:{}", host, port);
             if addr == self.port {

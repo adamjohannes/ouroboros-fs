@@ -9,6 +9,7 @@ use tokio::io::{
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::process::Command;
 use tokio::time::sleep;
+use tracing;
 
 use crate::{
     node::{self, Node, append_edge, port_str},
@@ -47,24 +48,25 @@ pub async fn run(bind_addr: &str, gossip_interval: Duration) -> Result<(), AnyEr
 
     // Initialize Node structure
     let node = Node::new(local.to_string(), gossip_interval);
-    println!("[{}] node listening on {}", node.port, node.port);
+    tracing::info!(node = %node.port, "Node listening");
 
     // Create nodes/<port> directory once the node is up
     let port_only = port_str(&node.port);
     let node_dir = format!("nodes/{}", port_only);
     if let Err(e) = fs::create_dir_all(&node_dir).await {
-        eprintln!("[{}] failed to create {}: {}", node.port, node_dir, e);
+        tracing::error!(node = %node.port, dir = %node_dir, error = ?e, "Failed to create node directory");
     } else {
-        println!("[{}] created {}", node.port, node_dir);
+        tracing::info!(node = %node.port, dir = %node_dir, "Created node directory");
     }
 
     // Spawn the gossip loop
     if gossip_interval > Duration::from_millis(0) {
         let gossip_node = Arc::clone(&node);
         tokio::spawn(async move {
-            println!(
-                "[{}] Gossip loop starting (interval: {:?})",
-                gossip_node.port, gossip_interval
+            tracing::info!(
+                node = %gossip_node.port,
+                interval = ?gossip_interval,
+                "Gossip loop starting"
             );
             spawn_gossip_loop(gossip_node).await;
         });
@@ -80,7 +82,7 @@ pub async fn run(bind_addr: &str, gossip_interval: Duration) -> Result<(), AnyEr
 
         tokio::spawn(async move {
             if let Err(e) = handle_client(node, stream).await {
-                eprintln!("[{node_port}] client {peer}: error: {e}");
+                tracing::error!(node = %node_port, peer = %peer, error = ?e, "Client connection error");
             }
         });
     }
@@ -249,16 +251,16 @@ async fn handle_ring_forward<W: AsyncWrite + Unpin>(
     mut ttl: u32,
     msg: String,
 ) -> Result<(), AnyErr> {
-    println!("[{}] RING FORWARD(ttl={}) msg: {}", node.port, ttl, msg);
+    tracing::debug!(node = %node.port, ttl, msg = %msg, "RING FORWARD");
 
     if ttl > 0 {
         ttl -= 1;
         if let Some(next_addr) = node.get_next().await {
             if let Err(e) = node.forward_ring_forward(ttl, &msg).await {
-                eprintln!("[{}] forward error to {}: {}", node.port, next_addr, e);
+                tracing::warn!(node = %node.port, target = %next_addr, error = ?e, "RING FORWARD failed");
             }
         } else {
-            eprintln!("[{}] no next node set; dropping", node.port);
+            tracing::warn!(node = %node.port, "No next node set, dropping RING FORWARD");
         }
     }
 
@@ -326,9 +328,11 @@ async fn handle_topology_hop<W: AsyncWrite + Unpin>(
             .send_topology_done(&start_addr, &token, &new_history)
             .await
         {
-            eprintln!(
-                "[{}] TOPOLOGY DONE send failed to {}: {}",
-                node.port, start_addr, e
+            tracing::warn!(
+                node = %node.port,
+                target = %start_addr,
+                error = ?e,
+                "TOPOLOGY DONE send failed"
             );
         }
     } else {
@@ -336,9 +340,11 @@ async fn handle_topology_hop<W: AsyncWrite + Unpin>(
             .forward_topology_hop(&token, &start_addr, &new_history)
             .await
         {
-            eprintln!(
-                "[{}] TOPOLOGY HOP forward failed to {}: {}",
-                node.port, next_addr, e
+            tracing::warn!(
+                node = %node.port,
+                target = %next_addr,
+                error = ?e,
+                "TOPOLOGY HOP forward failed"
             );
         }
     }
@@ -424,9 +430,11 @@ async fn handle_netmap_hop<W: AsyncWrite + Unpin>(
             .send_netmap_done(&start_addr, &token, &new_entries)
             .await
         {
-            eprintln!(
-                "[{}] NETMAP DONE send failed to {}: {}",
-                node.port, start_addr, e
+            tracing::warn!(
+                node = %node.port,
+                target = %start_addr,
+                error = ?e,
+                "NETMAP DONE send failed"
             );
         }
     } else {
@@ -434,9 +442,11 @@ async fn handle_netmap_hop<W: AsyncWrite + Unpin>(
             .forward_netmap_hop(&token, &start_addr, &new_entries)
             .await
         {
-            eprintln!(
-                "[{}] NETMAP HOP forward failed to {}: {}",
-                node.port, next_addr, e
+            tracing::warn!(
+                node = %node.port,
+                target = %next_addr,
+                error = ?e,
+                "NETMAP HOP forward failed"
             );
         }
     }
@@ -557,11 +567,13 @@ where
     let mut first = vec![0u8; first_len as usize];
     reader.read_exact(&mut first).await?;
     let saved_as = save_into_node_dir(node, &chunk_file_name(&name, 0, parts), &first).await?;
-    println!(
-        "[{}] saved chunk 1/{parts}: {} ({} bytes)",
-        node.port,
-        saved_as.display(),
-        first_len
+    tracing::info!(
+        node = %node.port,
+        chunk = 1,
+        parts,
+        file = %saved_as.display(),
+        bytes = first_len,
+        "Saved file chunk"
     );
 
     // Open connection to next and stream the remaining bytes
@@ -615,7 +627,7 @@ where
 
     // Save locally
     if let Err(e) = save_into_node_dir(node, &name, &buf).await {
-        eprintln!("[{}] failed to save file '{}': {}", node.port, name, e);
+        tracing::error!(node = %node.port, file_name = %name, error = ?e, "Failed to save relayed file blob");
     }
 
     // Forward to next
@@ -624,7 +636,7 @@ where
             .forward_file_relay_blob(&token, &start_addr, size, &name, &buf)
             .await
         {
-            eprintln!("[{}] FILE RELAY-BLOB forward failed: {}", node.port, e);
+            tracing::warn!(node = %node.port, error = ?e, "FILE RELAY-BLOB forward failed");
         }
     }
 
@@ -665,13 +677,13 @@ where
 
     // Save my chunk locally
     let saved_as = save_into_node_dir(node, &chunk_file_name(&name, index, parts), &buf).await?;
-    println!(
-        "[{}] saved chunk {}/{}: {} ({} bytes)",
-        node.port,
-        index + 1,
+    tracing::info!(
+        node = %node.port,
+        chunk = index + 1,
         parts,
-        saved_as.display(),
-        my_len
+        file = %saved_as.display(),
+        bytes = my_len,
+        "Saved file chunk"
     );
 
     // If not the last chunk, forward remaining bytes to next with index+1
@@ -936,23 +948,25 @@ async fn spawn_gossip_loop(node: Arc<Node>) {
 
         // Find out who to ping
         let Some(next_addr) = node.get_next().await else {
-            println!(
-                "[{}] Gossip: No next node set, skipping health check.",
-                node.port
+            tracing::debug!(
+                node = %node.port,
+                "Gossip: No next node set, skipping health check."
             );
             continue;
         };
 
-        println!("[{}] Gossip: Sending PING to {}", node.port, next_addr);
+        tracing::debug!(node = %node.port, target = %next_addr, "Gossip: Sending PING");
         match check_node_health(node.clone(), &next_addr).await {
             Ok(_) => {
-                println!("[{}] Gossip: Received PONG from {}", node.port, next_addr);
+                tracing::debug!(node = %node.port, from = %next_addr, "Gossip: Received PONG");
             }
             Err(e) => {
                 // Health check failed, start the healing process
-                eprintln!(
-                    "[{}] Gossip: Health check failed for {}: {}",
-                    node.port, next_addr, e
+                tracing::error!(
+                    node = %node.port,
+                    target = %next_addr,
+                    error = ?e,
+                    "Gossip: Health check failed"
                 );
 
                 // Start healing in a new task to not block the gossip loop
@@ -960,7 +974,7 @@ async fn spawn_gossip_loop(node: Arc<Node>) {
                 tokio::spawn(async move {
                     let node_port = heal_node.port.clone();
                     if let Err(e) = handle_node_death(heal_node, next_addr).await {
-                        eprintln!("[{node_port}] Gossip: Node healing process failed: {e}");
+                        tracing::error!(node = %node_port, error = ?e, "Gossip: Node healing process failed");
                     }
                 });
             }
@@ -990,9 +1004,10 @@ async fn check_node_health(_node: Arc<Node>, addr: &str) -> Result<(), AnyErr> {
 
 /// The healing process workflow
 async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), AnyErr> {
-    println!(
-        "[{}] Starting healing process for node {}",
-        node.port, dead_addr
+    tracing::info!(
+        node = %node.port,
+        dead_node = %dead_addr,
+        "Starting healing process"
     );
     let dead_port = port_str(&dead_addr).to_string();
     let dead_host = host_of(&dead_addr);
@@ -1003,11 +1018,16 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
         .await;
 
     // 2. Broadcast change
-    println!("[{}] Broadcasting node {} as Dead", node.port, dead_port);
+    tracing::info!(
+        node = %node.port,
+        target_node = %dead_port,
+        status = "Dead",
+        "Broadcasting node status"
+    );
     node.broadcast_netmap_update().await;
 
     // 3. Start a new process
-    println!("[{}] Respawning node at {}", node.port, full_dead_addr);
+    tracing::info!(node = %node.port, respawn_addr = %full_dead_addr, "Respawning node");
     let exe = current_exe()?;
 
     let mut cmd = Command::new(exe);
@@ -1021,31 +1041,37 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
     let _ = cmd.spawn()?;
 
     // Wait for it to be up
-    println!(
-        "[{}] Waiting for respawned node {} to listen...",
-        node.port, full_dead_addr
+    tracing::info!(
+        node = %node.port,
+        respawn_addr = %full_dead_addr,
+        "Waiting for respawned node to listen..."
     );
     wait_until_listening(dead_host, dead_port.parse()?, Duration::from_secs(10)).await?;
-    println!("[{}] Respawned node {} is up.", node.port, full_dead_addr);
+    tracing::info!(node = %node.port, respawn_addr = %full_dead_addr, "Respawned node is up.");
 
     // 4. Update map to Alive
     node.update_node_status(dead_port.clone(), crate::NodeStatus::Alive)
         .await;
 
     // 5. Share shared data
-    println!(
-        "[{}] Sharing network data with {}",
-        node.port, full_dead_addr
+    tracing::info!(
+        node = %node.port,
+        target_node = %full_dead_addr,
+        "Sharing network data with new node"
     );
     share_data_with_new_node(&node, &full_dead_addr).await?;
 
     // 6. Broadcast change (Alive)
-    println!("[{}] Broadcasting node {} as Alive", node.port, dead_port);
+    tracing::info!(
+        node = %node.port,
+        target_node = %dead_port,
+        status = "Alive",
+        "Broadcasting node status"
+    );
     node.broadcast_netmap_update().await;
 
-    println!(
-        "[{}] Healing process for {} complete.",
-        node.port, full_dead_addr
+    tracing::info!(
+        node = %node.port, healed_node = %full_dead_addr, "Healing process complete."
     );
     Ok(())
 }
