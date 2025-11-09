@@ -6,7 +6,7 @@
 ---
 
 | ![OuroborosFS Logo](docs/assets/ouroboros_fs_logo.png) |
-|:--:|
+|:------------------------------------------------------:|
 
 ---
 
@@ -44,30 +44,33 @@ The system shards files across the network for distributed storage. Each node st
 
 * **File Push:**
 
-  1. A client sends a `FILE PUSH <size> <name>` command to any node.
-  2. That node determines the network size (N) from its known "netmap".
-  3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
-     of the file's binary stream
-     to its neighbor using a `FILE RELAY-STREAM` command.
-  4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
-     continues until all N chunks are
-     stored on N different nodes.
+    1. A client sends a `FILE PUSH <size> <name>` command to any node.
+    2. That node determines the network size (N) from its known "netmap".
+    3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
+       of the file's binary stream
+       to its neighbor using a `FILE RELAY-STREAM` command.
+    4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
+       continues until all N chunks are
+       stored on N different nodes.
 
 * **File Pull:**
 
-  1. A client sends a `FILE PULL <name>` command to any node.
-  2. The node consults its internal `file_tags` map to find the file's size, its "start node" (holding chunk 1), and the
-     total number of `parts`.
-  3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (e.g.,
-     `a.txt.part-002-of-003`).
-  4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
-     directory and returns it.
-  5. **Failure Path:** If the target node is dead (request fails), the originating node:
-     a. Marks the target node as `Dead` in its local netmap and broadcasts this update to the ring.
-     b. Finds the dead node's **predecessor** (which holds the backup).
-     c. Sends a `FILE GET-BACKUP-CHUNK` command to the predecessor, which reads the chunk from its `backup/` directory and
-     returns it.
-  6. The originating node reassembles all chunks in order and streams the complete file back to the client.
+    1. A client sends a `FILE PULL <name>` command to any node.
+    2. The node consults its internal `file_tags` map to find the file's size, its "start node" (holding chunk 1), and
+       the
+       total number of `parts`.
+    3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (
+       e.g.,
+       `a.txt.part-002-of-003`).
+    4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
+       directory and returns it.
+    5. **Failure Path:** If the target node is dead (request fails), the originating node:
+       a. Marks the target node as `Dead` in its local netmap and broadcasts this update to the ring.
+       b. Finds the dead node's **predecessor** (which holds the backup).
+       c. Sends a `FILE GET-BACKUP-CHUNK` command to the predecessor, which reads the chunk from its `backup/` directory
+       and
+       returns it.
+    6. The originating node reassembles all chunks in order and streams the complete file back to the client.
 
 ### Data Replication (Backup)
 
