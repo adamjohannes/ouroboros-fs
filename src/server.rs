@@ -119,6 +119,15 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 }
                 protocol::Command::NodeStatus => handle_node_status(&node, &mut writer).await?,
                 protocol::Command::NodePing => handle_node_ping(&mut writer).await?,
+                protocol::Command::NodeHeal => {
+                    handle_node_heal(Arc::clone(&node), &mut writer).await?
+                }
+                protocol::Command::NodeHealHop { token, start_addr } => {
+                    handle_node_heal_hop(Arc::clone(&node), &mut writer, token, start_addr).await?
+                }
+                protocol::Command::NodeHealDone { token } => {
+                    handle_node_heal_done(&node, &mut writer, token).await?
+                }
 
                 // RING
                 protocol::Command::RingForward { ttl, msg } => {
@@ -262,6 +271,155 @@ async fn handle_node_status<W: AsyncWrite + Unpin>(
 
 async fn handle_node_ping<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), AnyErr> {
     writer.write_all(b"PONG\n").await?;
+    Ok(())
+}
+
+/// Handles "NODE HEAL"
+/// Starts a walk that forces every node to check and heal its neighbor.
+async fn handle_node_heal<W: AsyncWrite + Unpin>(
+    node: Arc<Node>,
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    let token = node.make_walk_token();
+    let rx = node.register_heal_walk(&token).await;
+
+    // Spawn a task to do the first check and start the walk
+    let start_addr = node.port.clone();
+    let node_clone = Arc::clone(&node);
+    tokio::spawn(async move {
+        if let Err(e) = check_and_heal_neighbor(node_clone, &token, &start_addr).await {
+            tracing::error!(
+                node = %start_addr,
+                token = %token,
+                error = ?e,
+                "Heal walk: First check failed"
+            );
+        }
+    });
+
+    // Wait for the walk to complete (or time out)
+    let walk_timeout = Duration::from_secs(60);
+    match tokio::time::timeout(walk_timeout, rx).await {
+        Ok(Ok(())) => {
+            writer.write_all(b"OK network healed\n").await?;
+        }
+        Ok(Err(_)) => {
+            writer.write_all(b"ERR heal walk canceled\n").await?;
+        }
+        Err(_) => {
+            writer.write_all(b"ERR heal walk timed out\n").await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handles "NODE HEAL-HOP <token> <start_addr>"
+/// This is received by a node, which then checks its neighbor.
+async fn handle_node_heal_hop<W: AsyncWrite + Unpin>(
+    node: Arc<Node>,
+    writer: &mut W,
+    token: String,
+    start_addr: String,
+) -> Result<(), AnyErr> {
+    // 1. ACK the hop request immediately
+    writer.write_all(b"OK\n").await?;
+
+    // 2. Spawn a task to do the actual work
+    tokio::spawn(async move {
+        let node_port = node.port.clone();
+        if let Err(e) = check_and_heal_neighbor(node, &token, &start_addr).await {
+            tracing::error!(
+                node = %node_port,
+                token = %token,
+                error = ?e,
+                "Heal walk: Check/forward failed"
+            );
+        }
+    });
+
+    Ok(())
+}
+
+/// Handles "NODE HEAL-DONE <token>"
+/// This is received by the start node when the walk is complete.
+async fn handle_node_heal_done<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    token: String,
+) -> Result<(), AnyErr> {
+    // Signal the original "handle_node_heal" waiter
+    node.finish_heal_walk(&token).await;
+    writer.write_all(b"OK\n").await?;
+    Ok(())
+}
+
+/// Logic for one step of the heal walk.
+/// 1. Get neighbor.
+/// 2. Check if neighbor is start. If so, send HEAL-DONE.
+/// 3. If not, ping neighbor.
+/// 4. If ping OK, forward HEAL-HOP.
+/// 5. If ping FAIL, run `handle_node_death`, then forward HEAL-HOP.
+async fn check_and_heal_neighbor(
+    node: Arc<Node>,
+    token: &str,
+    start_addr: &str,
+) -> Result<(), AnyErr> {
+    let Some(next_addr) = node.get_next().await else {
+        tracing::warn!(node = %node.port, "Heal walk: No next node set, stopping walk.");
+        return Ok(()); // Stop the walk
+    };
+
+    // 1. Check if the ring was completed
+    if port_str(&next_addr) == port_str(start_addr) {
+        tracing::info!(node = %node.port, token = %token, "Heal walk: Completed ring, sending DONE.");
+        let mut s = TcpStream::connect(start_addr).await?;
+        s.write_all(format!("NODE HEAL-DONE {}\n", token).as_bytes())
+            .await?;
+        return Ok(());
+    }
+
+    // 2. Node is not the start, so check its health
+    match check_node_health(node.clone(), &next_addr).await {
+        Ok(_) => {
+            // 3. Node is ALIVE -> Forward the HEAL-HOP request
+            tracing::debug!(node = %node.port, target = %next_addr, "Heal walk: Node is alive, forwarding hop.");
+            let mut s = TcpStream::connect(&next_addr).await?;
+            s.write_all(format!("NODE HEAL-HOP {} {}\n", token, start_addr).as_bytes())
+                .await?;
+        }
+        Err(e) => {
+            // 3. Node is DEAD -> Heal it, then forward
+            tracing::warn!(
+                node = %node.port,
+                target = %next_addr,
+                error = ?e,
+                "Heal walk: Node is dead, starting healing process."
+            );
+
+            // This blocks until the node is respawned and synced
+            if let Err(heal_err) = handle_node_death(node.clone(), next_addr.clone()).await {
+                tracing::error!(
+                    node = %node.port,
+                    target = %next_addr,
+                    error = ?heal_err,
+                    "Heal walk: `handle_node_death` failed. Stopping walk."
+                );
+                return Err(heal_err); // Stop the walk
+            }
+
+            // 4. Forward the HEAL-HOP to the newly respawned node
+            tracing::info!(
+                node = %node.port,
+                target = %next_addr,
+                "Heal walk: Node healed, forwarding hop."
+            );
+            let mut s = TcpStream::connect(&next_addr).await?;
+            s.write_all(format!("NODE HEAL-HOP {} {}\n", token, start_addr).as_bytes())
+                .await?;
+        }
+    }
+
     Ok(())
 }
 
