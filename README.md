@@ -11,12 +11,14 @@ It allows you to spawn multiple server nodes that automatically wire themselves 
 the network are **sharded** (split) and distributed across all nodes. The network is **self-healing**: it detects node
 failures, automatically respawns them, and reintegrates them into the ring by syncing the network state.
 
------
+---
 
 ## Core Features
 
 * **Distributed File Storage:** Files are automatically sharded (split) and stored in chunks across all nodes in the
   ring.
+* **Data Replication:** Implements a single-neighbor backup model. Each node automatically stores a backup copy of the
+  data chunks from its successor node.
 * **Self-Healing Ring:** Nodes constantly check their neighbors. If a node crashes, its neighbor detects the failure,
   respawns the dead node, and syncs the network state (topology, file locations) to the new process.
 * **Automatic Discovery:** Includes protocols for mapping the ring's topology (`TOPOLOGY WALK`) and discovering the
@@ -24,21 +26,24 @@ failures, automatically respawns them, and reintegrates them into the ring by sy
 * **Simple Text Protocol:** Interaction is done via a simple, line-based text protocol, easily accessible with tools
   like `netcat`.
 
------
+---
 
 ## How It Works
 
 ### File Storage
 
-The system shards files across the network for distributed storage.
+The system shards files across the network for distributed storage. Each node stores its chunks in a
+`nodes/<port>/content/` directory.
 
 * **File Push:**
 
     1. A client sends a `FILE PUSH <size> <name>` command to any node.
     2. That node determines the network size (N) from its known "netmap".
-    3. It reads the first chunk (1/N) of the file, saves it locally, and forwards the *rest* of the file's binary stream
+    3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
+       of the file's binary stream
        to its neighbor using a `FILE RELAY-STREAM` command.
-    4. This process repeats: the next node saves chunk 2/N and forwards the rest. This continues until all N chunks are
+    4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
+       continues until all N chunks are
        stored on N different nodes.
 
 * **File Pull:**
@@ -47,8 +52,29 @@ The system shards files across the network for distributed storage.
     2. The node consults its internal `file_tags` map to find the file's size and its "start node" (the node holding
        chunk 1).
     3. It then "walks" the ring, starting from the start node, sending `FILE GET-CHUNK` to each node in sequence.
-    4. Each node returns its local chunk of the file.
+    4. Each node reads its local chunk *from its `content/` directory* and returns it.
     5. The originating node reassembles the chunks in order and streams the complete file back to the client.
+
+### Data Replication (Backup)
+
+In addition to sharding, the network automatically replicates data for extra resilience. It uses a single-neighbor
+backup model: **each node is responsible for backing up the data of its successor (neighbor).**
+
+For example, in a `7000 -> 7001 -> 7002` ring:
+
+* Node `7000` will back up data from Node `7001`.
+* Node `7001` will back up data from Node `7002`.
+* Node `7002` will back up data from Node `7000`.
+
+This is achieved using an active notification workflow:
+
+1. **Store Content:** When Node `7001` receives a file chunk (e.g., `a.txt.part-002-of-003`), it saves it to its local
+   `nodes/7001/content/` directory.
+2. **Notify Predecessor:** Immediately after saving, Node `7001` sends a `FILE NOTIFY-CHUNK-SAVED` command to its
+   predecessor (Node `7000`), telling it the chunk name.
+3. **Fetch for Backup:** Node `7000` receives this notification, connects back to Node `7001`, and requests the full
+   chunk data using `FILE GET-CHUNK-FOR-BACKUP`.
+4. **Store Backup:** Node `7000` receives the data and saves it to its local `nodes/7000/backup/` directory.
 
 ### Fault Tolerance
 
@@ -66,7 +92,7 @@ The network actively monitors and heals itself.
       speed.
     * Marks the node as `Alive` and broadcasts the final update.
 
------
+---
 
 ## Getting Started
 
@@ -76,9 +102,9 @@ You'll need the Rust toolchain installed.
 
 ```bash
 cargo build --release
-```
+````
 
-### 2. Run a Network
+### 2\. Run a Network
 
 The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you.
 
@@ -90,9 +116,10 @@ cargo run --release -- set-network --nodes 5 --base-port 7000
 
 This command will block, holding the network open. Press `Ctrl-C` to shut down all child node processes.
 
-### 3. Interact with the Network
+### 3\. Interact with the Network
 
-The [`scripts/`](./scripts) directory contains helpers for interacting with the ring (via port 7000 by default) using
+The [`scripts/`](https://www.google.com/search?q=./scripts) directory contains helpers for interacting with the ring (
+via port 7000 by default) using
 `netcat`.
 
 ```bash
@@ -109,7 +136,7 @@ The [`scripts/`](./scripts) directory contains helpers for interacting with the 
 ./scripts/get_nodes.sh
 ```
 
------
+---
 
 ## Protocol Overview
 
@@ -140,5 +167,9 @@ These commands are used by the nodes to communicate with each other.
 * **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining stream) to the next node during a `FILE PUSH`
   operation.
 * **`FILE GET-CHUNK <name>`**: Requests a specific file chunk from another node during a `FILE PULL` operation.
+* **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -\> Node i) Notifies the predecessor node that a new chunk is
+  available for backup.
+* **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup (
+  response is size-prefixed).
 * **`... HOP` / `... DONE`**: Various commands like `NETMAP HOP` and `TOPOLOGY DONE` are used to pass discovery messages
   around the ring until they return to their origin.
