@@ -1,5 +1,10 @@
 # Rust Socket Server
 
+[![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml)
+[![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml)
+
+---
+
 This project is a distributed, fault-tolerant, ring-based network for file storage, written in Rust.
 
 It allows you to spawn multiple server nodes that automatically wire themselves into a ring topology. Files pushed to
