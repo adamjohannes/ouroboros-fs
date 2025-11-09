@@ -1,4 +1,5 @@
 use crate::NodeStatus;
+use serde::Serialize;
 use std::{
     collections::HashMap,
     sync::{
@@ -14,7 +15,7 @@ use tokio::{
 };
 use tracing;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileTag {
     pub start: u16,
     pub size: u64,
