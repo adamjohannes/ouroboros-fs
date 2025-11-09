@@ -1,7 +1,7 @@
 # OuroborosFS
 
-[![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml)
-[![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml)
+![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)
+![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)
 
 ---
 
@@ -21,6 +21,8 @@ failures, automatically respawns them, and reintegrates them into the ring by sy
   data chunks from its successor node.
 * **Self-Healing Ring:** Nodes constantly check their neighbors. If a node crashes, its neighbor detects the failure,
   respawns the dead node, and syncs the network state (topology, file locations) to the new process.
+* **Manual Healing:** A `NODE HEAL` command allows a client to trigger a ring-wide health check, forcing every node to
+  check its neighbor and initiate the healing process for any dead nodes it finds.
 * **Automatic Discovery:** Includes protocols for mapping the ring's topology (`TOPOLOGY WALK`) and discovering the
   status of all nodes (`NETMAP DISCOVER`).
 * **Simple Text Protocol:** Interaction is done via a simple, line-based text protocol, easily accessible with tools
@@ -37,23 +39,30 @@ The system shards files across the network for distributed storage. Each node st
 
 * **File Push:**
 
-    1. A client sends a `FILE PUSH <size> <name>` command to any node.
-    2. That node determines the network size (N) from its known "netmap".
-    3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
-       of the file's binary stream
-       to its neighbor using a `FILE RELAY-STREAM` command.
-    4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
-       continues until all N chunks are
-       stored on N different nodes.
+1. A client sends a `FILE PUSH <size> <name>` command to any node.
+2. That node determines the network size (N) from its known "netmap".
+3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
+   of the file's binary stream
+   to its neighbor using a `FILE RELAY-STREAM` command.
+4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
+   continues until all N chunks are
+   stored on N different nodes.
 
 * **File Pull:**
 
-    1. A client sends a `FILE PULL <name>` command to any node.
-    2. The node consults its internal `file_tags` map to find the file's size and its "start node" (the node holding
-       chunk 1).
-    3. It then "walks" the ring, starting from the start node, sending `FILE GET-CHUNK` to each node in sequence.
-    4. Each node reads its local chunk *from its `content/` directory* and returns it.
-    5. The originating node reassembles the chunks in order and streams the complete file back to the client.
+1. A client sends a `FILE PULL <name>` command to any node.
+2. The node consults its internal `file_tags` map to find the file's size, its "start node" (holding chunk 1), and the
+   total number of `parts`.
+3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (e.g.,
+   `a.txt.part-002-of-003`).
+4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
+   directory and returns it.
+5. **Failure Path:** If the target node is dead (request fails), the originating node:
+   a. Marks the target node as `Dead` in its local netmap and broadcasts this update to the ring.
+   b. Finds the dead node's **predecessor** (which holds the backup).
+   c. Sends a `FILE GET-BACKUP-CHUNK` command to the predecessor, which reads the chunk from its `backup/` directory and
+   returns it.
+6. The originating node reassembles all chunks in order and streams the complete file back to the client.
 
 ### Data Replication (Backup)
 
@@ -91,6 +100,9 @@ The network actively monitors and heals itself.
     * Shares all critical state (`NETMAP SET`, `TOPOLOGY SET`, `FILE TAGS-SET`) with the new node to bring it up to
       speed.
     * Marks the node as `Alive` and broadcasts the final update.
+4. **Proactive Detection:** The `FILE PULL` operation also actively detects failures. If it fails to retrieve a chunk
+   from a node, it will immediately mark that node as `Dead` and broadcast the update, often detecting failures faster
+   than the gossip loop.
 
 ---
 
@@ -102,7 +114,7 @@ You'll need the Rust toolchain installed.
 
 ```bash
 cargo build --release
-````
+```
 
 ### 2\. Run a Network
 
@@ -118,8 +130,7 @@ This command will block, holding the network open. Press `Ctrl-C` to shut down a
 
 ### 3\. Interact with the Network
 
-The [`scripts/`](https://www.google.com/search?q=./scripts) directory contains helpers for interacting with the ring (
-via port 7000 by default) using
+The [`scripts/`](./scripts) directory contains helpers for interacting with the ring (via port 7000 by default) using
 `netcat`.
 
 ```bash
@@ -134,6 +145,9 @@ via port 7000 by default) using
 
 # Get the status of all nodes in the network
 ./scripts/get_nodes.sh
+
+# Manually trigger a network-wide health check and heal
+./scripts/heal_network.sh
 ```
 
 ---
@@ -149,6 +163,8 @@ These are the primary commands you would send to a node.
 
 * **`NODE NEXT <addr>`**: Sets the next hop for a node to form the ring.
 * **`NODE STATUS`**: Asks a node for its port and configured next hop.
+* **`NODE HEAL`**: (Client -\> any node) Initiates a manual, ring-wide heal walk. Each node is forced to check its
+  neighbor and respawn it if it's dead. Blocks until the entire ring has been checked.
 * **`NETMAP GET`**: Asks a node for its current view of the network map (all nodes and their `Alive`/`Dead` status).
 * **`TOPOLOGY WALK`**: Initiates a ring walk to map the connections (e.g., `7000->7001;7001->7002`).
 * **`FILE PUSH <size> <name>`**: Initiates a file upload. The client must send this header line, followed by *exactly*
@@ -162,6 +178,8 @@ These are the primary commands you would send to a node.
 These commands are used by the nodes to communicate with each other.
 
 * **`NODE PING`**: Health check. Expects a `PONG` response.
+* **`NODE HEAL-HOP <token> <start_addr>`**: Passes the heal-walk token to the next node after a successful health check.
+* **`NODE HEAL-DONE <token>`**: Sent by the last node back to the start node to complete the heal walk.
 * **`NETMAP SET <entries>`**: Broadcasts an updated network map (e.g., `7000=Alive,7001=Dead`) to another node.
 * **`TOPOLOGY SET <history>`**: Broadcasts a complete topology map to another node.
 * **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining stream) to the next node during a `FILE PUSH`
@@ -171,5 +189,7 @@ These commands are used by the nodes to communicate with each other.
   available for backup.
 * **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup (
   response is size-prefixed).
+* **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
+  `/backup` directory. Used by `FILE PULL` as a failover when a node is dead.
 * **`... HOP` / `... DONE`**: Various commands like `NETMAP HOP` and `TOPOLOGY DONE` are used to pass discovery messages
   around the ring until they return to their origin.
