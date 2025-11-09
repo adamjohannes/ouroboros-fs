@@ -1,6 +1,22 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import nodesData from '../../nodes.json'
+import { computed, onMounted, onUnmounted } from 'vue'
+import { useNetworkStore } from '@/stores/network'
+
+const store = useNetworkStore()
+let timerId: number | undefined = undefined
+
+onMounted(() => {
+  // Fetch immediately on component mount
+  store.fetchNodes()
+  // Poll for new data every 5 seconds
+  timerId = window.setInterval(store.fetchNodes, 5000)
+})
+
+onUnmounted(() => {
+  // Clean up the timer when the component is destroyed
+  if (timerId) clearInterval(timerId)
+})
+
 
 // Layout Constants
 
@@ -16,10 +32,11 @@ const nodeRadius = 4
 // Computed Positions
 
 /**
- * Calculates the {x, y} position for each node.
+ * Calculates the {x, y} position for each node from the store.
  */
 const nodes = computed(() => {
-  const nodeIds = Object.keys(nodesData)
+  // Get live data from the Pinia store
+  const nodeIds = Object.keys(store.nodes)
   const n = nodeIds.length
   const positions: { id: string; x: number; y: number; status: boolean }[] = []
 
@@ -30,7 +47,7 @@ const nodes = computed(() => {
       id: id,
       x: center.x,
       y: center.y,
-      status: nodesData[id as keyof typeof nodesData]
+      status: store.nodes[id] === 'Alive'
     })
     return positions
   }
@@ -45,9 +62,9 @@ const nodes = computed(() => {
     const y = center.y + radius * Math.sin(angle)
 
     const id = nodeIds[i]
-    const status = nodesData[id as keyof typeof nodesData]
+    const status = store.nodes[id] === 'Alive'
 
-    positions.push({id, x, y, status})
+    positions.push({ id, x, y, status })
   }
 
   return positions
@@ -85,6 +102,13 @@ const lines = computed(() => {
 </script>
 
 <template>
+  <div class="nodes-header">
+    <h3>Node Status</h3>
+    <small v-if="!store.nodesLoading">
+      Last Updated: {{ store.lastNodesUpdate }}
+    </small>
+    <small v-if="store.nodesLoading">Loading...</small>
+  </div>
   <svg
       :viewBox="`0 0 ${viewBox.width} ${viewBox.height}`"
       xmlns="http://www.w3.org/2000/svg"
@@ -92,8 +116,7 @@ const lines = computed(() => {
   >
     <g class="lines">
       <line
-          v-for="line in lines"
-          :key="line.id"
+          v-for="line in lines" :key="line.id"
           :x1="line.x1"
           :y1="line.y1"
           :x2="line.x2"
@@ -127,10 +150,16 @@ const lines = computed(() => {
 </template>
 
 <style scoped>
+.nodes-header {
+  text-align: center;
+}
+.nodes-header small {
+  color: #555;
+}
 .nodes-graph {
   width: 100%;
   max-width: 600px;
-  margin: 2rem auto;
+  margin: 1rem auto;
   display: block;
 }
 
