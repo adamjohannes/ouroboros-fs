@@ -58,9 +58,6 @@ enum Cmd {
         /// Run the DNS Gateway on this port
         #[arg(long = "dns-port")]
         dns_port: Option<u16>,
-        /// Time (ms) between gateway status polls
-        #[arg(long = "dns-poll", default_value_t = 10000u64)]
-        dns_poll_ms: u64,
     },
 }
 
@@ -93,7 +90,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             wait_time,
             overwrite_nodes_dir,
             dns_port,
-            dns_poll_ms,
         } => {
             set_network(
                 nodes,
@@ -104,7 +100,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 wait_time,
                 overwrite_nodes_dir,
                 dns_port,
-                dns_poll_ms,
             )
             .await
         }
@@ -151,7 +146,6 @@ async fn set_network(
     wait_time: u64,
     overwrite_nodes_dir: bool,
     dns_port: Option<u16>,
-    dns_poll_ms: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if nodes == 0 {
         tracing::warn!("--nodes must be >= 1");
@@ -245,15 +239,6 @@ async fn set_network(
             .collect();
 
         let gateway = ouroboros_fs::Gateway::new(node_addrs);
-
-        // Spawn the polling loop in the background
-        let poll_gateway = Arc::clone(&gateway);
-        let poll_interval = Duration::from_millis(dns_poll_ms);
-        tokio::spawn(async move {
-            // Give nodes a moment to initialize
-            sleep(Duration::from_millis(1000)).await;
-            poll_gateway.run_polling_loop(poll_interval).await;
-        });
 
         // Spawn the main gateway server
         let server_gateway = Arc::clone(&gateway);
