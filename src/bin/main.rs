@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use libc;
 use ring::run;
 use std::{env, error::Error, fs, path::Path, path::PathBuf, time::Duration};
 use tokio::{
@@ -135,6 +136,22 @@ async fn set_network(
         return Ok(());
     }
 
+    // Make this parent `set-network` process a new process group leader, then
+    // all children spawned by it (and their children) will inherit this PGID.
+    #[cfg(unix)]
+    let pgid = std::process::id();
+    #[cfg(unix)]
+    unsafe {
+        if libc::setpgid(0, 0) == -1 {
+            eprintln!(
+                "Warning: could not set process group: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            println!("Process group leader set with PGID {pgid}");
+        }
+    }
+
     // Prepare a fresh "nodes/" directory
     let nodes_root = Path::new("nodes");
     if nodes_root.exists() {
@@ -160,12 +177,6 @@ async fn set_network(
             .arg(&addr)
             .arg("--wait-time")
             .arg(wait_time.to_string());
-
-        #[cfg(unix)]
-        {
-            // use std::os::unix::process::CommandExt as _;
-            let _ = cmd.process_group(0);
-        }
 
         let child = cmd.spawn()?;
         children.push(child);
@@ -223,9 +234,25 @@ async fn set_network(
     }
 
     // 8. Cleanup
-    for mut child in children {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    #[cfg(unix)]
+    {
+        println!("Stopping process group {pgid}...");
+        // Send SIGTERM to the entire process group
+        unsafe {
+            libc::kill(-(pgid as i32), libc::SIGTERM);
+        }
+        // Wait for all children we know about to exit
+        for mut child in children {
+            let _ = child.wait().await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Fallback for non-Unix (Windows)
+        for mut child in children {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
     }
     Ok(())
 }

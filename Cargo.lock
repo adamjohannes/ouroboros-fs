@@ -221,6 +221,7 @@ name = "rust_socket_server"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "tokio",
 ]
 

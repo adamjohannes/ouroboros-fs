@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, error, path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
@@ -1016,12 +1016,6 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
         .arg(&full_dead_addr)
         .arg("--wait-time")
         .arg(node.gossip_interval.as_millis().to_string());
-
-    #[cfg(unix)]
-    {
-        // use std::os::unix::process::CommandExt as _;
-        let _ = cmd.process_group(0);
-    }
 
     // Spawn the child and detach it
     let _ = cmd.spawn()?;
