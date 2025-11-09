@@ -1,9 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-
-const props = defineProps<{
-  nodeCount: number
-}>()
+import nodesData from '../../nodes.json'
 
 // Layout Constants
 
@@ -22,12 +19,19 @@ const nodeRadius = 4
  * Calculates the {x, y} position for each node.
  */
 const nodes = computed(() => {
-  const n = props.nodeCount
-  const positions: { id: number; x: number; y: number }[] = []
+  const nodeIds = Object.keys(nodesData)
+  const n = nodeIds.length
+  const positions: { id: string; x: number; y: number; status: boolean }[] = []
 
   // Case 1: Single node at the center
   if (n === 1) {
-    positions.push({ id: 1, x: center.x, y: center.y })
+    const id = nodeIds[0]
+    positions.push({
+      id: id,
+      x: center.x,
+      y: center.y,
+      status: nodesData[id as keyof typeof nodesData]
+    })
     return positions
   }
 
@@ -39,7 +43,11 @@ const nodes = computed(() => {
     const angle = startAngle + i * angleIncrement
     const x = center.x + radius * Math.cos(angle)
     const y = center.y + radius * Math.sin(angle)
-    positions.push({ id: i + 1, x, y })
+
+    const id = nodeIds[i]
+    const status = nodesData[id as keyof typeof nodesData]
+
+    positions.push({id, x, y, status})
   }
 
   return positions
@@ -100,6 +108,7 @@ const lines = computed(() => {
           :cx="node.x"
           :cy="node.y"
           :r="nodeRadius"
+          :fill="node.status ? '#42b883' : '#e63946'"
       />
     </g>
 
@@ -131,7 +140,6 @@ const lines = computed(() => {
 }
 
 .nodes circle {
-  fill: #42b883;
   stroke: #333;
   stroke-width: 0.5;
 }

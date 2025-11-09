@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref } from 'vue'
 import NodesGraph from './components/NodesGraph.vue'
 import DirectoryTree from './components/DirectoryTree.vue'
 
-const nodeCount = ref(4) // Start with a square
 const containerRef = ref<HTMLElement | null>(null)
 const leftPanelWidth = ref('50%')
 const isResizing = ref(false)
@@ -34,7 +33,6 @@ function doResize(event: MouseEvent) {
 
 function stopResize() {
   isResizing.value = false
-  // IMPORTANT: Remove global listeners
   window.removeEventListener('mousemove', doResize)
   window.removeEventListener('mouseup', stopResize)
 }
@@ -49,18 +47,7 @@ function stopResize() {
 
     <div class="panel panel-left" :style="{ flexBasis: leftPanelWidth }">
       <div class="panel-content">
-        <div class="controls">
-          <label for="nodes">Number of Nodes: {{ nodeCount }}</label>
-          <input
-              id="nodes"
-              v-model.number="nodeCount"
-              type="range"
-              min="1"
-              max="20"
-              step="1"
-          />
-        </div>
-        <NodesGraph :node-count="nodeCount" />
+        <NodesGraph />
       </div>
     </div>
 
@@ -129,19 +116,5 @@ header {
 }
 .splitter:hover {
   background-color: #d0d0d0;
-}
-
-.controls {
-  max-width: 600px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 1.2rem;
-}
-
-.controls input[type='range'] {
-  width: 100%;
 }
 </style>
