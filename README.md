@@ -1,4 +1,4 @@
-# Rust Socket Server
+# OuroborosFS
 
 [![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml)
 [![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml)

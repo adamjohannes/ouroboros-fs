@@ -1,5 +1,5 @@
 [package]
-name = "rust_socket_server"
+name = "OuroborosFS"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,9 +11,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 
 [lib]
-name = "ring"
+name = "ouroboros_fs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rust_socket_server"
+name = "ouroboros_fs"
 path = "src/bin/main.rs"
