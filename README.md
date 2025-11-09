@@ -5,6 +5,13 @@
 
 ---
 
+<div style="text-align: center;">
+    <img src="docs/assets/ouroboros_fs_logo.png" alt="OuroborosFS Logo" width="75%" />
+</div>
+
+
+---
+
 This project is a distributed, fault-tolerant, ring-based network for file storage, written in Rust.
 
 It allows you to spawn multiple server nodes that automatically wire themselves into a ring topology. Files pushed to
