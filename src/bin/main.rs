@@ -11,11 +11,7 @@ use tokio::{
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
-#[command(
-    name = "rust_socket_server",
-    version,
-    about = "Ring TCP server & tools"
-)]
+#[command(name = "ouroboros_fs", version, about = "Ring TCP server & tools")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -56,6 +52,9 @@ enum Cmd {
         /// Time (ms) between health checks for each node. 0 to disable.
         #[arg(short = 'w', long = "wait-time", default_value_t = 5000u64)]
         wait_time: u64,
+        /// Inform if the "nodes" directory should be reused.
+        #[arg(short, long)]
+        overwrite_nodes_dir: bool,
     },
 }
 
@@ -86,6 +85,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             no_block,
             wait_ms,
             wait_time,
+            overwrite_nodes_dir,
         } => {
             set_network(
                 nodes,
@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 !no_block,
                 Duration::from_millis(wait_ms),
                 wait_time,
+                overwrite_nodes_dir,
             )
             .await
         }
@@ -138,6 +139,7 @@ async fn set_network(
     block: bool,
     extra_wait: Duration,
     wait_time: u64,
+    overwrite_nodes_dir: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if nodes == 0 {
         tracing::warn!("--nodes must be >= 1");
@@ -162,8 +164,9 @@ async fn set_network(
 
     // Prepare a fresh "nodes/" directory
     let nodes_root = Path::new("nodes");
-    if nodes_root.exists() {
+    if nodes_root.exists() && overwrite_nodes_dir {
         fs::remove_dir_all(nodes_root)?;
+        tracing::info!("Created a fresh 'nodes' directory");
     }
     fs::create_dir_all(nodes_root)?;
 
