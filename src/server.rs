@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use std::{env, error, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
