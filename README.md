@@ -125,7 +125,7 @@ When a client connects, the gateway "sniffs" the first line of the request to de
   serves a REST API used by the web dashboard, providing endpoints like:
     * `GET /api/nodes`: Returns a JSON map of all nodes and their `Alive`/`Dead` status.
     * `GET /api/files`: Returns a JSON list of all known files.
-    * `POST /api/upload`: Accepts raw file bytes to push a new file to the network.
+    * `POST /api/push`: Accepts raw file bytes to push a new file to the network.
 * **TCP Proxy:** If the request is not HTTP, the gateway assumes it's a text-based protocol command (like
   `FILE PUSH ...`). It checks its internal, cached list of healthy nodes, finds one that is `Alive`, and transparently
   proxies the entire TCP connection to that node.

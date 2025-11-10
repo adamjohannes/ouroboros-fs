@@ -98,15 +98,15 @@ impl Gateway {
                 // Handle CORS preflight requests
                 Self::send_options_response(writer).await
             }
-            ("GET", "/api/nodes") => match self.fetch_node_map().await {
+            ("GET", "/netmap/get") => match self.fetch_node_map().await {
                 Ok(map) => Self::send_json_response(writer, &map).await,
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
-            ("GET", "/api/files") => match self.fetch_file_list().await {
+            ("GET", "/file/list") => match self.fetch_file_list().await {
                 Ok(list) => Self::send_json_response(writer, &list).await,
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
-            ("POST", "/api/upload") => match self.handle_file_upload(reader).await {
+            ("POST", "/file/push") => match self.handle_file_upload(reader).await {
                 Ok(_) => {
                     Self::send_json_response(writer, serde_json::json!({"status": "ok"})).await
                 }

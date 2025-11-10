@@ -20,13 +20,13 @@ export const useNetworkStore = defineStore('network', () => {
     const lastFilesUpdate = ref<string>('')
     const lastNodesUpdate = ref<string>('')
     const uploadLoading = ref(false)
-    const API_BASE = 'http://127.0.0.1:8000/api' // TODO: dynamically update this with envs
+    const API_BASE = 'http://127.0.0.1:8000' // TODO: dynamically update this with envs
 
     /** Fetches the latest node status from the gateway */
-    async function fetchNodes() {
+    async function netmapGet() {
         nodesLoading.value = true
         try {
-            const response = await fetch(`${API_BASE}/nodes`)
+            const response = await fetch(`${API_BASE}/netmap/get`)
             if (!response.ok) throw new Error('Network response was not ok')
 
             nodes.value = await response.json()
@@ -39,10 +39,10 @@ export const useNetworkStore = defineStore('network', () => {
     }
 
     /** Fetches the latest file list from the gateway */
-    async function fetchFiles() {
+    async function fileList() {
         filesLoading.value = true
         try {
-            const response = await fetch(`${API_BASE}/files`)
+            const response = await fetch(`${API_BASE}/file/list`)
             if (!response.ok) throw new Error('Network response was not ok')
 
             files.value = await response.json()
@@ -55,10 +55,10 @@ export const useNetworkStore = defineStore('network', () => {
     }
 
     /** Uploads a file to the network */
-    async function uploadFile(file: File) {
+    async function filePush(file: File) {
         uploadLoading.value = true
         try {
-            const response = await fetch(`${API_BASE}/upload`, {
+            const response = await fetch(`${API_BASE}/file/push`, {
                 method: 'POST',
                 headers: {
                     // Send raw bytes, not multipart-form
@@ -70,11 +70,11 @@ export const useNetworkStore = defineStore('network', () => {
 
             if (!response.ok) {
                 const errText = await response.text();
-                throw new Error(`Upload failed: ${errText}`);
+                throw new Error(`Push failed: ${errText}`);
             }
 
             // Refresh the file list to show the new file
-            await fetchFiles();
+            await fileList();
 
         } catch (error) {
             console.error('Failed to upload file:', error)
@@ -95,8 +95,8 @@ export const useNetworkStore = defineStore('network', () => {
         uploadLoading,
 
         // Actions
-        fetchNodes,
-        fetchFiles,
-        uploadFile,
+        netmapGet,
+        fileList,
+        filePush,
     }
 })

@@ -16,9 +16,9 @@ let timerId: number | undefined = undefined
 
 onMounted(() => {
   // Fetch immediately
-  store.fetchFiles()
+  store.fileList()
   // Set up the auto-refresh timer
-  timerId = window.setInterval(store.fetchFiles, props.refreshInterval)
+  timerId = window.setInterval(store.fileList, props.refreshInterval)
 })
 
 onUnmounted(() => {
@@ -34,7 +34,7 @@ onUnmounted(() => {
         <h3>File List</h3>
         <small>{{ store.lastFilesUpdate }}</small>
       </div>
-      <button @click="store.fetchFiles" :disabled="store.filesLoading">
+      <button @click="store.fileList" :disabled="store.filesLoading">
         {{ store.filesLoading ? 'Refreshing...' : 'Refresh' }}
       </button>
     </div>

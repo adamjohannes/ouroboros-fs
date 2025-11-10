@@ -7,9 +7,9 @@ let timerId: number | undefined = undefined
 
 onMounted(() => {
   // Fetch immediately on component mount
-  store.fetchNodes()
+  store.netmapGet()
   // Poll for new data every 5 seconds
-  timerId = window.setInterval(store.fetchNodes, 5000)
+  timerId = window.setInterval(store.netmapGet, 5000)
 })
 
 onUnmounted(() => {

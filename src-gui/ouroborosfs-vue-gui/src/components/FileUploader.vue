@@ -24,7 +24,7 @@ async function uploadFile() {
   const fileToUpload = selectedFile.value
   selectedFile.value = null
 
-  await store.uploadFile(fileToUpload)
+  await store.filePush(fileToUpload)
 }
 </script>
 
