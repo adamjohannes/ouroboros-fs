@@ -19,6 +19,7 @@ export const useNetworkStore = defineStore('network', () => {
     const filesLoading = ref(false)
     const lastFilesUpdate = ref<string>('')
     const lastNodesUpdate = ref<string>('')
+    const uploadLoading = ref(false)
     const API_BASE = 'http://127.0.0.1:8000/api' // TODO: dynamically update this with envs
 
     /** Fetches the latest node status from the gateway */
@@ -53,6 +54,36 @@ export const useNetworkStore = defineStore('network', () => {
         }
     }
 
+    /** Uploads a file to the network */
+    async function uploadFile(file: File) {
+        uploadLoading.value = true
+        try {
+            const response = await fetch(`${API_BASE}/upload`, {
+                method: 'POST',
+                headers: {
+                    // Send raw bytes, not multipart-form
+                    'Content-Type': 'application/octet-stream',
+                    'X-Filename': file.name, // Send filename in a custom header
+                },
+                body: file, // The browser will stream the file body
+            });
+
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(`Upload failed: ${errText}`);
+            }
+
+            // Refresh the file list to show the new file
+            await fetchFiles();
+
+        } catch (error) {
+            console.error('Failed to upload file:', error)
+            alert(`Error uploading file: ${error}`);
+        } finally {
+            uploadLoading.value = false
+        }
+    }
+
     return {
         // State
         nodes,
@@ -61,8 +92,11 @@ export const useNetworkStore = defineStore('network', () => {
         filesLoading,
         lastFilesUpdate,
         lastNodesUpdate,
+        uploadLoading,
+
         // Actions
         fetchNodes,
         fetchFiles,
+        uploadFile,
     }
 })
