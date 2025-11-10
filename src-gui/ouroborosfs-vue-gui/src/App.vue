@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import NodesGraph from './components/NodesGraph.vue'
 import DirectoryTree from './components/DirectoryTree.vue'
+import FileUploader from './components/FileUploader.vue'
 
 const containerRef = ref<HTMLElement | null>(null)
 const leftPanelWidth = ref('50%')
@@ -54,7 +55,9 @@ function stopResize() {
     <div class="splitter" @mousedown="startResize"></div>
 
     <div class="panel panel-right">
-      <DirectoryTree :refresh-interval="5000" />
+      <div class="panel-content panel-right-layout">
+        <DirectoryTree class="directory-tree-wrapper" />
+        <FileUploader class="file-uploader-wrapper" /> </div>
     </div>
 
   </div>
@@ -103,6 +106,21 @@ header {
 .panel-content {
   overflow-y: auto;
   padding: 1rem;
+}
+
+.panel-right-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+}
+.directory-tree-wrapper {
+  flex-grow: 1;
+  overflow-y: auto;
+  padding: 1rem;
+}
+.file-uploader-wrapper {
+  flex-shrink: 0;
 }
 
 .splitter {
