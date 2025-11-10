@@ -1,5 +1,8 @@
 # OuroborosFS
 
+![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)
+![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)
+
 ---
 
 | ![OuroborosFS Logo](docs/assets/ouroboros_fs_logo.png) |
