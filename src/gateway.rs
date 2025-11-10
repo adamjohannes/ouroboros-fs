@@ -1,9 +1,12 @@
-use crate::{NodeStatus};
+use crate::NodeStatus;
 use serde::Serialize;
+use serde_json;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
+};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug)]
@@ -58,74 +61,184 @@ impl Gateway {
         }
 
         // 2. Check if the protocol is HTTP raw TCP
-        if first_line.starts_with("GET /") {
+        if first_line.starts_with("GET /")
+            || first_line.starts_with("POST /")
+            || first_line.starts_with("OPTIONS /")
+        {
             // Handle HTTP request
             tracing::debug!(line = %first_line.trim(), "Handling HTTP request");
-            self.handle_http_request(&mut writer, &first_line).await?;
+            self.handle_http_request(&mut buf_reader, &mut writer, &first_line)
+                .await?;
         } else {
             // Handle raw TCP
-            tracing::debug!(line = %first_line.trim(), "Handling TCP proxy request");
-            // Re-combine the stream to pass it to the proxy handler
-            let stream = buf_reader.into_inner().reunite(writer)?;
-            self.handle_tcp_proxy(stream, &first_line).await?;
+            tracing::debug!(line = %first_line.trim(), "Handling TCP proxy");
+            self.handle_tcp_proxy(buf_reader, writer, &first_line)
+                .await?;
         }
         Ok(())
     }
 
     // --- HTTP HANDLER ---
 
-    async fn handle_http_request(
+    async fn handle_http_request<R>(
         self: Arc<Self>,
+        reader: &mut BufReader<R>,
         writer: &mut (impl AsyncWrite + Unpin),
         first_line: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+    {
         let parts: Vec<&str> = first_line.split_whitespace().collect();
-        let path = if parts.len() > 1 { parts[1] } else { "/" };
+        let method = parts.get(0).cloned().unwrap_or("GET");
+        let path = parts.get(1).cloned().unwrap_or("/");
 
-        match path {
-            "/api/nodes" => match self.fetch_node_map().await {
+        match (method, path) {
+            ("OPTIONS", _) => {
+                // Handle CORS preflight requests
+                Self::send_options_response(writer).await
+            }
+            ("GET", "/api/nodes") => match self.fetch_node_map().await {
                 Ok(map) => Self::send_json_response(writer, &map).await,
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
-            "/api/files" => match self.fetch_file_list().await {
+            ("GET", "/api/files") => match self.fetch_file_list().await {
                 Ok(list) => Self::send_json_response(writer, &list).await,
+                Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
+            },
+            ("POST", "/api/upload") => match self.handle_file_upload(reader).await {
+                Ok(_) => {
+                    Self::send_json_response(writer, serde_json::json!({"status": "ok"})).await
+                }
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
             _ => Self::send_error_response(writer, 404, "Not Found").await,
         }
     }
 
-    // --- TCP HANDLER ---
-
-    async fn handle_tcp_proxy(
+    /// Handles the `POST /api/upload` request
+    async fn handle_file_upload<R>(
         self: Arc<Self>,
-        mut client_stream: TcpStream,
-        first_line: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Find a live node
-        let Some(addr) = self.find_alive_node().await else {
-            client_stream
-                .write_all(b"ERR no nodes available in the network\n")
-                .await?;
-            return Ok(());
-        };
+        reader: &mut BufReader<R>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        // 1. Read headers to find Content-Length and X-Filename
+        let mut content_length: u64 = 0;
+        let mut filename: Option<String> = None;
+        let mut line = String::new();
 
-        // 2. Connect to that node
-        let mut node_stream = match TcpStream::connect(&addr).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                client_stream
-                    .write_all(b"ERR failed to connect to target node\n")
-                    .await?;
-                return Err(e.into());
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                break; // Premature end
             }
-        };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break; // End of headers
+            }
 
-        // 3. Send the line that was already read from the client
+            if let Some((key, value)) = trimmed.split_once(':') {
+                let key_lower = key.to_ascii_lowercase();
+                let value_trimmed = value.trim();
+
+                if key_lower == "content-length" {
+                    content_length = value_trimmed.parse().unwrap_or(0);
+                }
+                if key_lower == "x-filename" {
+                    // Sanitize filename
+                    let safe_name = value_trimmed.replace(
+                        |c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-',
+                        "_",
+                    );
+                    filename = Some(safe_name);
+                }
+            }
+        }
+
+        if content_length == 0 || filename.is_none() {
+            return Err("Missing Content-Length or X-Filename header".into());
+        }
+
+        let filename = filename.unwrap();
+        let size = content_length;
+
+        tracing::info!(file = %filename, bytes = size, "Receiving file from HTTP POST");
+
+        // 2. Read the raw body
+        let mut file_body = vec![0; size as usize];
+        reader.read_exact(&mut file_body).await?;
+
+        // 3. Connect to the ring
+        let mut node_stream = self.connect_to_ring().await?;
+
+        // 4. Send the FILE PUSH command
+        let header = format!("FILE PUSH {} {}\n", size, filename);
+        node_stream.write_all(header.as_bytes()).await?;
+
+        // 5. Stream the file body to the node
+        node_stream.write_all(&file_body).await?;
+
+        // 6. Wait for the "OK" from the node to confirm success
+        let mut node_reader = BufReader::new(node_stream);
+        let mut node_response = String::new();
+        let mut found_ok = false;
+
+        // Read lines until we get an "OK" or the stream ends
+        while node_reader.read_line(&mut node_response).await? > 0 {
+            if node_response.starts_with("OK") {
+                found_ok = true;
+                break;
+            }
+            node_response.clear(); // Clear for next line
+        }
+
+        if !found_ok {
+            return Err("Node failed to store file: did not receive OK".to_string().into());
+        }
+
+        tracing::info!(file = %filename, "File successfully pushed to ring");
+        Ok(())
+    }
+
+    // --- TCP PROXY HANDLER ---
+
+    /// This is the proxy for all TCP commands
+    async fn handle_tcp_proxy<R>(
+        self: Arc<Self>,
+        mut client_reader: BufReader<R>,
+        mut client_writer: impl AsyncWrite + Unpin,
+        first_line: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        // 1. Connect to node
+        let mut node_stream = self.connect_to_ring().await?;
+        tracing::debug!(addr = ?node_stream.peer_addr(), "Gateway connected to ring node");
+
+        // 2. Send the first line
         node_stream.write_all(first_line.as_bytes()).await?;
 
-        // 4. Proxy all remaining data in both directions
-        copy_bidirectional_manual(&mut client_stream, &mut node_stream).await?;
+        // 3. Proxy all remaining data in both directions
+        let (mut node_read, mut node_write) = node_stream.split();
+
+        // `client_reader` is the BufReader, which will empty its
+        // internal buffer first before reading from the underlying stream.
+        let client_to_server = copy(&mut client_reader, &mut node_write);
+        let server_to_client = copy(&mut node_read, &mut client_writer);
+
+        // Use `try_join!` to wait for both halves to complete.
+        match tokio::try_join!(client_to_server, server_to_client) {
+            Ok(_) => {
+                tracing::debug!("TCP proxy finished successfully.");
+            }
+            Err(e) => {
+                tracing::debug!(error = ?e, "TCP proxy finished with error");
+            }
+        }
+
         Ok(())
     }
 
@@ -206,17 +319,18 @@ impl Gateway {
         Err("Could not connect to any node in the ring".into())
     }
 
-    /// Finds the first 'Alive' node.
-    async fn find_alive_node(&self) -> Option<String> {
-        for addr in &self.node_addrs {
-            if TcpStream::connect(addr).await.is_ok() {
-                return Some(addr.clone());
-            }
-        }
-        None
-    }
-
     // --- HTTP HELPERS ---
+
+    /// Sends a 204 No Content response for OPTIONS preflight requests
+    async fn send_options_response(writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
+        let response = "HTTP/1.1 204 No Content\r\n\
+                        Access-Control-Allow-Origin: *\r\n\
+                        Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n\
+                        Access-Control-Allow-Headers: Content-Type, X-Filename\r\n\
+                        Connection: close\r\n\
+                        \r\n";
+        writer.write_all(response.as_bytes()).await
+    }
 
     async fn send_json_response<T: Serialize>(
         writer: &mut (impl AsyncWrite + Unpin),
@@ -224,7 +338,13 @@ impl Gateway {
     ) -> io::Result<()> {
         let json = serde_json::to_string(&data).unwrap_or("{}".to_string());
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
             json.len(),
             json
         );
@@ -237,7 +357,13 @@ impl Gateway {
         message: &str,
     ) -> io::Result<()> {
         let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\n\
+             Content-Type: text/plain\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
             status,
             message,
             message.len(),
@@ -245,19 +371,4 @@ impl Gateway {
         );
         writer.write_all(response.as_bytes()).await
     }
-}
-
-// Manual copy_bidirectional that works with a pre-split stream
-async fn copy_bidirectional_manual(
-    client: &mut TcpStream,
-    server: &mut TcpStream,
-) -> io::Result<()> {
-    let (mut client_read, mut client_write) = client.split();
-    let (mut server_read, mut server_write) = server.split();
-
-    tokio::select! {
-        res = copy(&mut client_read, &mut server_write) => res,
-        res = copy(&mut server_read, &mut client_write) => res,
-    }?;
-    Ok(())
 }
