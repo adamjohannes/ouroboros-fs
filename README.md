@@ -1,8 +1,5 @@
 # OuroborosFS
 
-![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)
-![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)
-
 ---
 
 | ![OuroborosFS Logo](docs/assets/ouroboros_fs_logo.png) |
@@ -10,14 +7,15 @@
 
 ---
 
-This project is a distributed, fault-tolerant, ring-based network for file storage, written in Rust.
+This project is a distributed, fault-tolerant, ring-based network for file storage, written in Rust. It also includes an
+optional **web-based dashboard** built with Vue.js for visualizing the network and managing files.
 
 It allows you to spawn multiple server nodes that automatically wire themselves into a ring topology. Files pushed to
 the network are **sharded** (split) and distributed across all nodes. The network is **self-healing**: it detects node
 failures, automatically respawns them, and reintegrates them into the ring by syncing the network state.
 
 It also includes an optional **gateway service** that acts as a single entry point, automatically proxying client
-requests to any healthy node in the ring.
+requests (both raw TCP and HTTP) to any healthy node in the ring.
 
 ---
 
@@ -29,8 +27,10 @@ requests to any healthy node in the ring.
   data chunks from its successor node.
 * **Self-Healing Ring:** Nodes constantly check their neighbors. If a node crashes, its neighbor detects the failure,
   respawns the dead node, and syncs the network state (topology, file locations) to the new process.
-* **Optional Gateway Service:** Run a single-entry-point gateway that discovers healthy nodes and automatically proxies
-  client commands (e.g., `FILE PUSH`, `FILE PULL`) to them.
+* **Optional Gateway Service:** Run a single-entry-point gateway that discovers healthy nodes and proxies requests. It
+  supports a raw TCP proxy for `netcat` clients and an **HTTP REST API** for the web dashboard.
+* **Web-based Dashboard:** Includes a Vue.js frontend to visualize the network status in real-time, list all distributed
+  files, and upload new content via the gateway's HTTP API.
 * **Manual Healing:** A `NODE HEAL` command allows a client to trigger a ring-wide health check, forcing every node to
   check its neighbor and initiate the healing process for any dead nodes it finds.
 * **Automatic Discovery:** Includes protocols for mapping the ring's topology (`TOPOLOGY WALK`) and discovering the
@@ -52,18 +52,15 @@ The system shards files across the network for distributed storage. Each node st
     1. A client sends a `FILE PUSH <size> <name>` command to any node.
     2. That node determines the network size (N) from its known "netmap".
     3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
-       of the file's binary stream
-       to its neighbor using a `FILE RELAY-STREAM` command.
+       of the file's binary stream to its neighbor using a `FILE RELAY-STREAM` command.
     4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
-       continues until all N chunks are
-       stored on N different nodes.
+       continues until all N chunks are stored on N different nodes.
 
 * **File Pull:**
 
     1. A client sends a `FILE PULL <name>` command to any node.
     2. The node consults its internal `file_tags` map to find the file's size, its "start node" (holding chunk 1), and
-       the
-       total number of `parts`.
+       the total number of `parts`.
     3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (
        e.g., `a.txt.part-002-of-003`).
     4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
@@ -72,8 +69,7 @@ The system shards files across the network for distributed storage. Each node st
        a. Marks the target node as `Dead` in its local netmap and broadcasts this update to the ring.
        b. Finds the dead node's **predecessor** (which holds the backup).
        c. Sends a `FILE GET-BACKUP-CHUNK` command to the predecessor, which reads the chunk from its `backup/` directory
-       and
-       returns it.
+       and returns it.
     6. The originating node reassembles all chunks in order and streams the complete file back to the client.
 
 ### Data Replication (Backup)
@@ -101,8 +97,7 @@ This is achieved using an active notification workflow:
 
 The network actively monitors and heals itself.
 
-1. **Gossip:** Each node runs a "gossip loop" to send a `NODE PING` command to its next
-   neighbor.
+1. **Gossip:** Each node runs a "gossip loop" to send a `NODE PING` command to its next neighbor.
 2. **Detection:** If the neighbor doesn't respond with `PONG`, it's assumed to be dead.
 3. **Healing:** The detecting node immediately:
     * Marks the neighbor as `Dead` in its local network map.
@@ -116,18 +111,21 @@ The network actively monitors and heals itself.
    from a node, it will immediately mark that node as `Dead` and broadcast the update, often detecting failures faster
    than the gossip loop.
 
-### Gateway Service (Mini-DNS)
+### Gateway Service (TCP Proxy & HTTP API)
 
 You can optionally run a gateway service using the `--dns-port` flag when running `set-network`. This service acts as a
 simple, stateless proxy and single entry point for the network.
 
-1. **Polling:** The gateway runs a background loop. At a regular interval (set by `--dns-poll`), it sends a `NETMAP GET`
-   command to one of the ring nodes to fetch the status of the entire network.
-2. **Caching Status:** It uses the `NETMAP GET` response to build and refresh an internal map of all nodes and their
-   `Alive`/`Dead` status.
-3. **Proxying:** When a client connects to the gateway (e.g., to send a `FILE PUSH` command), the gateway checks its
-   internal map, finds the first available node marked as `Alive`, and transparently proxies the entire TCP connection
-   to that healthy node.
+When a client connects, the gateway "sniffs" the first line of the request to determine its type:
+
+* **HTTP API:** If the request starts with `GET`, `POST`, or `OPTIONS`, the gateway handles it as an HTTP request. This
+  serves a REST API used by the web dashboard, providing endpoints like:
+    * `GET /api/nodes`: Returns a JSON map of all nodes and their `Alive`/`Dead` status.
+    * `GET /api/files`: Returns a JSON list of all known files.
+    * `POST /api/upload`: Accepts raw file bytes to push a new file to the network.
+* **TCP Proxy:** If the request is not HTTP, the gateway assumes it's a text-based protocol command (like
+  `FILE PUSH ...`). It checks its internal, cached list of healthy nodes, finds one that is `Alive`, and transparently
+  proxies the entire TCP connection to that node.
 
 This provides a single, stable entry point for the network, so clients don't need to know the address of any specific
 node.
@@ -136,7 +134,7 @@ node.
 
 ## Getting Started
 
-### 1. Build
+### 1. Build the Backend
 
 You'll need the Rust toolchain installed.
 
@@ -146,25 +144,44 @@ cargo build --release
 
 ### 2. Run a Network
 
-The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you. To include the
-new gateway service, use the `--dns-port` flag.
+The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you. The
+`--dns-port` flag starts the gateway, which provides both the TCP proxy and the HTTP API.
 
 ```bash
 # This will start 5 nodes (7000-7004) AND a gateway service on port 8000
-# The gateway will poll the network status every 5 seconds
+# The gateway will provide the HTTP API on http://127.0.0.1:8000
+# and also act as a TCP proxy on the same port.
 cargo run --release -- set-network \
     --nodes 5 \
     --base-port 7000 \
-    --dns-port 8000 \
-    --dns-poll 5000
+    --dns-port 8000
 ```
 
-This command will block, holding the network open. It will also start a **gateway service** on the port specified by
-`--dns-port`. This gateway acts as a unified entry point for all client requests.
+This command will block, holding the network open.
 
-Press `Ctrl-C` to shut down all child node processes.
+### 3. Run the Web Dashboard (Optional)
 
-### 3. Interact with the Network
+The web dashboard is a separate Vue.js application. You'll need Node.js and `npm` installed.
+
+```bash
+# In a new terminal, navigate to the GUI directory
+cd src-gui/ouroborosfs-vue-gui
+
+# Install dependencies
+npm install
+
+# Run the frontend development server
+npm run dev
+```
+
+This will typically make the dashboard available at `http://localhost:5173`. It is pre-configured to communicate with
+the gateway API running on `http://127.0.0.1:8000`.
+
+### 4. Interact with the Network
+
+You now have two ways to interact with the network:
+
+#### Option A: Command Line (via Gateway)
 
 The [`scripts/`](./scripts) directory contains helpers for interacting with the ring using `netcat`. If you are running
 the **gateway service** (e.g., on port 8000), you can point all scripts to that single port.
@@ -181,26 +198,35 @@ the **gateway service** (e.g., on port 8000), you can point all scripts to that 
 
 # Get the status of all nodes (via the gateway)
 ./scripts/get_nodes.sh -p 8000
-
-# Manually trigger a network-wide health check (via the gateway)
-./scripts/heal_network.sh -p 8000
 ```
+
+#### Option B: Web Dashboard
+
+If you completed Step 3, open the URL from the `npm run dev` output in your browser.
+
+You can use the dashboard to:
+
+* See a live-updating graph of all nodes and their status.
+* See a list of all files stored in the network.
+* Upload new files using the "Share File" button.
 
 ---
 
 ## Protocol Overview
 
-The server communicates using a simple, line-based ASCII text protocol. Commands follow a `<NOUN> <VERB> [params...]`
-structure.
+The server's *internal* node-to-node and client-to-node communication uses a simple, line-based ASCII text protocol.
+Commands follow a `<NOUN> <VERB> [params...]` structure.
+
+> [!NOTE]
+> This is separate from the HTTP API provided by the gateway for the web dashboard.
 
 ### Client Commands
 
-These are the primary commands you would send to a node.
+These are the primary commands you would send to a node (or the gateway) via `netcat`.
 
 * **`NODE NEXT <addr>`**: Sets the next hop for a node to form the ring.
 * **`NODE STATUS`**: Asks a node for its port and configured next hop.
-* **`NODE HEAL`**: (Client -> any node) Initiates a manual, ring-wide heal walk. Each node is forced to check its
-  neighbor and respawn it if it's dead. Blocks until the entire ring has been checked.
+* **`NODE HEAL`**: (Client -\> any node) Initiates a manual, ring-wide heal walk.
 * **`NETMAP GET`**: Asks a node for its current view of the network map (all nodes and their `Alive`/`Dead` status).
 * **`TOPOLOGY WALK`**: Initiates a ring walk to map the connections (e.g., `7000->7001;7001->7002`).
 * **`FILE PUSH <size> <name>`**: Initiates a file upload. The client must send this header line, followed by *exactly*
@@ -214,18 +240,13 @@ These are the primary commands you would send to a node.
 These commands are used by the nodes to communicate with each other.
 
 * **`NODE PING`**: Health check. Expects a `PONG` response.
-* **`NODE HEAL-HOP <token> <start_addr>`**: Passes the heal-walk token to the next node after a successful health check.
-* **`NODE HEAL-DONE <token>`**: Sent by the last node back to the start node to complete the heal walk.
 * **`NETMAP SET <entries>`**: Broadcasts an updated network map (e.g., `7000=Alive,7001=Dead`) to another node.
 * **`TOPOLOGY SET <history>`**: Broadcasts a complete topology map to another node.
 * **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining stream) to the next node during a `FILE PUSH`
   operation.
 * **`FILE GET-CHUNK <name>`**: Requests a specific file chunk from another node during a `FILE PULL` operation.
-* **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -> Node i) Notifies the predecessor node that a new chunk is
+* **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -\> Node i) Notifies the predecessor node that a new chunk is
   available for backup.
-* **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -> Node i+1) Requests the raw bytes of a specific chunk for
-  backup (response is size-prefixed).
-* **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -> Node i-1) Requests a specific file chunk from the predecessor's  
-  `/backup` directory. Used by `FILE PULL` as a failover when a node is dead.
-* **`... HOP` / `... DONE`**: Various commands like `NETMAP HOP` and `TOPOLOGY DONE` are used to pass discovery messages
-  around the ring until they return to their origin.
+* **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup.
+* **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
+  `/backup` directory. Used by `FILE PULL` as a failover.
