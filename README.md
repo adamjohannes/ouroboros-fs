@@ -24,21 +24,21 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
 
 ## Core Features
 
-* **Distributed File Storage:** Files are automatically sharded (split) and stored in chunks across all nodes in the
+- **Distributed File Storage:** Files are automatically sharded (split) and stored in chunks across all nodes in the
   ring.
-* **Data Replication:** Implements a single-neighbor backup model. Each node automatically stores a backup copy of the
+- **Data Replication:** Implements a single-neighbor backup model. Each node automatically stores a backup copy of the
   data chunks from its successor node.
-* **Self-Healing Ring:** Nodes constantly check their neighbors. If a node crashes, its neighbor detects the failure,
+- **Self-Healing Ring:** Nodes constantly check their neighbors. If a node crashes, its neighbor detects the failure,
   respawns the dead node, and syncs the network state (topology, file locations) to the new process.
-* **Optional Gateway Service:** Run a single-entry-point gateway that discovers healthy nodes and proxies requests. It
+- **Optional Gateway Service:** Run a single-entry-point gateway that discovers healthy nodes and proxies requests. It
   supports a raw TCP proxy for `netcat` clients and an **HTTP REST API** for the web dashboard.
-* **Web-based Dashboard:** Includes a Vue.js frontend to visualize the network status in real-time, list all distributed
+- **Web-based Dashboard:** Includes a Vue.js frontend to visualize the network status in real-time, list all distributed
   files, and upload new content via the gateway's HTTP API.
-* **Manual Healing:** A `NODE HEAL` command allows a client to trigger a ring-wide health check, forcing every node to
+- **Manual Healing:** A `NODE HEAL` command allows a client to trigger a ring-wide health check, forcing every node to
   check its neighbor and initiate the healing process for any dead nodes it finds.
-* **Automatic Discovery:** Includes protocols for mapping the ring's topology (`TOPOLOGY WALK`) and discovering the
+- **Automatic Discovery:** Includes protocols for mapping the ring's topology (`TOPOLOGY WALK`) and discovering the
   status of all nodes (`NETMAP DISCOVER`).
-* **Simple Text Protocol:** Interaction is done via a simple, line-based text protocol, easily accessible with tools
+- **Simple Text Protocol:** Interaction is done via a simple, line-based text protocol, easily accessible with tools
   like `netcat`.
 
 ---
@@ -65,7 +65,7 @@ The system shards files across the network for distributed storage. Each node st
     2. The node consults its internal `file_tags` map to find the file's size, its "start node" (holding chunk 1), and
        the total number of `parts`.
     3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (
-       e.g., `a.txt.part-002-of-003`).
+       e.g., `content.txt.part-002-of-003`).
     4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
        directory and returns it.
     5. **Failure Path:** If the target node is dead (request fails), the originating node:
@@ -75,16 +75,16 @@ The system shards files across the network for distributed storage. Each node st
        and returns it.
     6. The originating node reassembles all chunks in order and streams the complete file back to the client.
 
-### Data Replication (Backup)
+### Data Replication
 
 In addition to sharding, the network automatically replicates data for extra resilience. It uses a single-neighbor
 backup model: **each node is responsible for backing up the data of its successor (neighbor).**
 
 For example, in a `7000 -> 7001 -> 7002` ring:
 
-* Node `7000` will back up data from Node `7001`.
-* Node `7001` will back up data from Node `7002`.
-* Node `7002` will back up data from Node `7000`.
+- Node `7000` will back up data from Node `7001`.
+- Node `7001` will back up data from Node `7002`.
+- Node `7002` will back up data from Node `7000`.
 
 This is achieved using an active notification workflow:
 
@@ -103,13 +103,13 @@ The network actively monitors and heals itself.
 1. **Gossip:** Each node runs a "gossip loop" to send a `NODE PING` command to its next neighbor.
 2. **Detection:** If the neighbor doesn't respond with `PONG`, it's assumed to be dead.
 3. **Healing:** The detecting node immediately:
-    * Marks the neighbor as `Dead` in its local network map.
-    * Broadcasts this updated map to all other nodes (`NETMAP SET`).
-    * **Respawns** the dead node by executing a new process.
-    * Waits for the new node to boot up.
-    * Shares all critical state (`NETMAP SET`, `TOPOLOGY SET`, `FILE TAGS-SET`) with the new node to bring it up to
+    - Marks the neighbor as `Dead` in its local network map.
+    - Broadcasts this updated map to all other nodes (`NETMAP SET`).
+    - **Respawns** the dead node by executing a new process.
+    - Waits for the new node to boot up.
+    - Shares all critical state (`NETMAP SET`, `TOPOLOGY SET`, `FILE TAGS-SET`) with the new node to bring it up to
       speed.
-    * Marks the node as `Alive` and broadcasts the final update.
+    - Marks the node as `Alive` and broadcasts the final update.
 4. **Proactive Detection:** The `FILE PULL` operation also actively detects failures. If it fails to retrieve a chunk
    from a node, it will immediately mark that node as `Dead` and broadcast the update, often detecting failures faster
    than the gossip loop.
@@ -123,9 +123,12 @@ When a client connects, the gateway "sniffs" the first line of the request to de
 
 * **HTTP API:** If the request starts with `GET`, `POST`, or `OPTIONS`, the gateway handles it as an HTTP request. This
   serves a REST API used by the web dashboard, providing endpoints like:
-    * `GET /api/nodes`: Returns a JSON map of all nodes and their `Alive`/`Dead` status.
-    * `GET /api/files`: Returns a JSON list of all known files.
-    * `POST /api/push`: Accepts raw file bytes to push a new file to the network.
+    - `GET /netmap/get`: Returns a JSON map of all nodes and their `Alive`/`Dead` status.
+    - `GET /file/list`: Returns a JSON list of all known files.
+    - `GET /file/pull/<name>`: Streams the raw file bytes for download.
+    - `POST /file/push`: Accepts raw file bytes (as `application/octet-stream`) to push a new file to the network.
+    - `POST /network/heal`: Triggers a manual, ring-wide network heal.
+    - `POST /node/<port>/kill`: Sends a kill signal to a specific node process.
 * **TCP Proxy:** If the request is not HTTP, the gateway assumes it's a text-based protocol command (like
   `FILE PUSH ...`). It checks its internal, cached list of healthy nodes, finds one that is `Alive`, and transparently
   proxies the entire TCP connection to that node.
@@ -209,9 +212,9 @@ If you completed Step 3, open the URL from the `npm run dev` output in your brow
 
 You can use the dashboard to:
 
-* See a live-updating graph of all nodes and their status.
-* See a list of all files stored in the network.
-* Upload new files using the "Share File" button.
+- See a live-updating graph of all nodes and their status.
+- See a list of all files stored in the network.
+- Upload new files using the "Share File" button.
 
 ---
 
@@ -227,29 +230,33 @@ Commands follow a `<NOUN> <VERB> [params...]` structure.
 
 These are the primary commands you would send to a node (or the gateway) via `netcat`.
 
-* **`NODE NEXT <addr>`**: Sets the next hop for a node to form the ring.
-* **`NODE STATUS`**: Asks a node for its port and configured next hop.
-* **`NODE HEAL`**: (Client -\> any node) Initiates a manual, ring-wide heal walk.
-* **`NETMAP GET`**: Asks a node for its current view of the network map (all nodes and their `Alive`/`Dead` status).
-* **`TOPOLOGY WALK`**: Initiates a ring walk to map the connections (e.g., `7000->7001;7001->7002`).
-* **`FILE PUSH <size> <name>`**: Initiates a file upload. The client must send this header line, followed by *exactly*
+- **`NODE NEXT <addr>`**: Sets the next hop for a node to form the ring.
+- **`NODE STATUS`**: Asks a node for its port and configured next hop.
+- **`NODE HEAL`**: (Client -\> any node) Initiates a manual, ring-wide heal walk.
+- **`NETMAP GET`**: Asks a node for its current view of the network map (all nodes and their `Alive`/`Dead` status).
+- **`NETMAP DISCOVER`**: (Client -\> any node) Initiates a ring walk to discover all nodes.
+- **`TOPOLOGY WALK`**: Initiates a ring walk to map the connections (e.g., `7000->7001;7001->7002`).
+- **`FILE PUSH <size> <name>`**: Initiates a file upload. The client must send this header line, followed by *exactly*
   `<size>` bytes of binary data.
-* **`FILE PULL <name>`**: Requests a file. The node responds with the *raw* binary file data, with no headers or
+- **`FILE PULL <name>`**: Requests a file. The node responds with the *raw* binary file data, with no headers or
   trailers.
-* **`FILE LIST`**: Asks a node for a CSV-formatted list of all known files and their metadata.
+- **`FILE LIST`**: Asks a node for a CSV-formatted list of all known files and their metadata.
 
 ### Internal (Node-to-Node) Commands
 
 These commands are used by the nodes to communicate with each other.
 
-* **`NODE PING`**: Health check. Expects a `PONG` response.
-* **`NETMAP SET <entries>`**: Broadcasts an updated network map (e.g., `7000=Alive,7001=Dead`) to another node.
-* **`TOPOLOGY SET <history>`**: Broadcasts a complete topology map to another node.
-* **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining stream) to the next node during a `FILE PUSH`
-  operation.
-* **`FILE GET-CHUNK <name>`**: Requests a specific file chunk from another node during a `FILE PULL` operation.
-* **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -\> Node i) Notifies the predecessor node that a new chunk is
+- **`NODE PING`**: Health check. Expects a `PONG` response.
+- **`NODE HEAL-HOP <token> <start_addr>`**: Continues a heal walk to the next node.
+- **`NODE HEAL-DONE <token>`**: Sent by the last node back to the start to complete the heal walk.
+- **`NETMAP SET <entries>`**: Broadcasts an updated network map (e.g., `7000=Alive,7001=Dead`) to another node.
+- **`TOPOLOGY SET <history>`**: Broadcasts a complete topology map to another node.
+- **`FILE TAGS-SET <entries>`**: Broadcasts the map of known files to another node.
+- **`FILE RELAY-BLOB ...`**: Forwards a file chunk (and the remaining *blob*) to the next node during a `FILE PUSH`.
+- **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining *stream*) to the next node during a `FILE PUSH`.
+- **`FILE GET-CHUNK <name>`**: Requests a specific file chunk from another node during a `FILE PULL` operation.
+- **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -\> Node i) Notifies the predecessor node that a new chunk is
   available for backup.
-* **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup.
-* **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
+- **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup.
+- **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
   `/backup` directory. Used by `FILE PULL` as a failover.
