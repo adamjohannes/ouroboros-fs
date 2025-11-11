@@ -77,17 +77,20 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 0 10px;
+  padding: 0;
   min-width: 300px;
+  color: #1a1a1a;
+  background-color: #e8e0db;
 }
 
 .header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  border-bottom: 1px solid #ccc;
-  padding-bottom: 8px;
+  border-bottom: 1px solid #333;
+  padding: 8px 10px;
   flex-shrink: 0;
+  background-color: #e8e0db;
 }
 
 .header h3 {
@@ -99,10 +102,32 @@ onUnmounted(() => {
   color: #555;
 }
 
+.header button {
+  background-color: #1a1a1a;
+  color: #f7f3ed;
+  border: 1px solid #1a1a1a;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
+.header button:hover {
+  background-color: #444;
+}
+
+.header button:disabled {
+  background-color: #aaa;
+  color: #eee;
+  cursor: not-allowed;
+}
+
+
 .tree-content {
   flex-grow: 1;
   overflow-y: auto;
-  padding-top: 10px;
+  padding-top: 0;
+  background-color: #e8e0db;
 }
 
 .empty-state {
@@ -120,19 +145,23 @@ onUnmounted(() => {
 
 .file-list-table th,
 .file-list-table td {
-  padding: 6px 8px;
+  padding: 6px 10px;
   text-align: left;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid #dcd6cb;
   vertical-align: middle;
 }
 
 .file-list-table th {
   font-weight: bold;
-  background-color: #f9f9f9;
+  background-color: #e8e0db;
+  position: sticky;
+  top: 0;
+  border-bottom-width: 2px;
+  border-bottom-color: #333;
 }
 
 .file-item:hover {
-  background-color: #f0f0f0;
+  background-color: #dcd6cb;
 }
 
 .actions-cell {
@@ -144,15 +173,15 @@ onUnmounted(() => {
   padding: 4px 10px;
   font-size: 0.9em;
   font-family: sans-serif;
-  color: #333;
-  background-color: #f0f0f0;
-  border: 1px solid #ccc;
+  color: #f7f3ed;
+  background-color: #1a1a1a;
+  border: 1px solid #1a1a1a;
   border-radius: 3px;
   cursor: pointer;
   transition: background-color 0.2s;
 }
 
 .pull-btn:hover {
-  background-color: #e0e0e0;
+  background-color: #444;
 }
 </style>

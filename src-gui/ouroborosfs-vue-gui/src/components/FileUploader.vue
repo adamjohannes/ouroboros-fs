@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { useNetworkStore } from '@/stores/network'
+import {ref} from 'vue'
+import {useNetworkStore} from '@/stores/network'
 
 const store = useNetworkStore()
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -47,26 +47,31 @@ async function uploadFile() {
 <style scoped>
 .file-uploader-container {
   padding: 10px;
-  border-top: 1px solid #eee;
-  background-color: #fcfcfc;
+  border-top: 1px solid #333;
+  background-color: #e8e0db;
 }
+
 .upload-btn {
   width: 100%;
   padding: 12px;
   font-size: 16px;
   font-weight: bold;
-  color: #fff;
-  background-color: #42b883;
-  border: none;
+  color: #f7f3ed;
+  background-color: #1a1a1a;
+  border: 1px solid #1a1a1a;
   border-radius: 4px;
   cursor: pointer;
   transition: background-color 0.2s;
 }
+
 .upload-btn:hover {
-  background-color: #369469;
+  background-color: #444;
 }
+
 .upload-btn:disabled {
   background-color: #aaa;
+  color: #eee;
+  border-color: #aaa;
   cursor: not-allowed;
 }
 </style>

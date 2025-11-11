@@ -70,13 +70,30 @@ html, body, #app {
   font-family: sans-serif;
   display: flex;
   flex-direction: column;
+  background-color: #e8e0db;
+  color: #1a1a1a;
 }
 
 header {
   text-align: center;
   padding: 1rem;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid #333;
   flex-shrink: 0;
+  background-color: #1a1a1a;
+  color: #f7f3ed;
+}
+
+.splitter {
+  flex-basis: 6px;
+  flex-shrink: 0;
+  flex-grow: 0;
+  background-color: #e8e3dc;
+  cursor: col-resize;
+  border-left: 1px solid #333;
+  border-right: 1px solid #333;
+}
+.splitter:hover {
+  background-color: #dcd6cb;
 }
 
 .resizable-container {
@@ -106,6 +123,10 @@ header {
 .panel-content {
   overflow-y: auto;
   padding: 1rem;
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .panel-right-layout {
@@ -117,22 +138,9 @@ header {
 .directory-tree-wrapper {
   flex-grow: 1;
   overflow-y: auto;
-  padding: 1rem;
+  padding: 0;
 }
 .file-uploader-wrapper {
   flex-shrink: 0;
-}
-
-.splitter {
-  flex-basis: 6px;
-  flex-shrink: 0;
-  flex-grow: 0;
-  background-color: #e0e0e0;
-  cursor: col-resize;
-  border-left: 1px solid #ccc;
-  border-right: 1px solid #ccc;
-}
-.splitter:hover {
-  background-color: #d0d0d0;
 }
 </style>
