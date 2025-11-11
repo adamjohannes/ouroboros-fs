@@ -20,6 +20,7 @@ export const useNetworkStore = defineStore('network', () => {
     const lastFilesUpdate = ref<string>('')
     const lastNodesUpdate = ref<string>('')
     const uploadLoading = ref(false)
+    const healLoading = ref(false)
     const API_BASE = 'http://127.0.0.1:8000' // TODO: dynamically update this with envs
 
     /** Fetches the latest node status from the gateway */
@@ -103,6 +104,35 @@ export const useNetworkStore = defineStore('network', () => {
         document.body.removeChild(link);
     }
 
+    /** Triggers a ring-wide NODE HEAL */
+    async function networkHeal() {
+        if (healLoading.value) return // Prevent concurrent heals
+        healLoading.value = true
+        try {
+            const response = await fetch(`${API_BASE}/network/heal`, {
+                method: 'POST',
+            });
+
+            const responseData = await response.json();
+
+            if (!response.ok) {
+                throw new Error(responseData.message || 'Heal request failed');
+            }
+
+            // Simple feedback to the user
+            alert(`Heal response: ${responseData.message}`);
+
+            // Refresh the node map
+            await netmapGet();
+
+        } catch (error) {
+            console.error('Failed to trigger heal:', error);
+            alert(`Error triggering heal: ${error}`);
+        } finally {
+            healLoading.value = false
+        }
+    }
+
     return {
         // State
         nodes,
@@ -112,11 +142,13 @@ export const useNetworkStore = defineStore('network', () => {
         lastFilesUpdate,
         lastNodesUpdate,
         uploadLoading,
+        healLoading,
 
         // Actions
         netmapGet,
         fileList,
         filePush,
         filePull,
+        networkHeal,
     }
 })
