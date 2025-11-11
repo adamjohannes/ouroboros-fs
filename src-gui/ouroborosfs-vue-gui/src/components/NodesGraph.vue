@@ -111,6 +111,19 @@ const lines = computed(() => {
 
   return lineData
 })
+
+/**
+ * Handle clicking on a node.
+ */
+function onNodeClick(nodeId: string) {
+  if (store.killingNodeId) return; // Prevent action if one is already in progress
+
+  // Confirm with the user
+  if (confirm(`Are you sure you want to kill node ${nodeId}? \nThe network should heal itself.`)) {
+    store.killNode(nodeId)
+  }
+}
+
 </script>
 
 <template>
@@ -123,10 +136,9 @@ const lines = computed(() => {
         </small>
         <small v-if="store.nodesLoading">Loading...</small>
       </div>
-      <div>
-        <button @click="store.netmapGet" :disabled="store.nodesLoading">
-          {{ store.nodesLoading ? 'Refreshing...' : 'Refresh' }}
-        </button>
+      <div> <button @click="store.netmapGet" :disabled="store.nodesLoading">
+        {{ store.nodesLoading ? 'Refreshing...' : 'Refresh' }}
+      </button>
 
         <button
             @click="store.networkHeal"
@@ -167,21 +179,23 @@ const lines = computed(() => {
         />
       </g>
 
-      <g class="nodes">
+      <g
+          v-for="node in nodes"
+          :key="`g-${node.id}`"
+          class="node-group"
+          @click="onNodeClick(node.id)"
+          :class="{
+          'is-loading': store.killingNodeId === node.id,
+          'is-dead': !node.status
+        }"
+      >
         <circle
-            v-for="node in nodes"
-            :key="`n-${node.id}`"
             :cx="node.x"
             :cy="node.y"
             :r="nodeRadius"
             :fill="node.status ? '#333333' : '#e63946'"
         />
-      </g>
-
-      <g class="labels">
         <text
-            v-for="node in nodes"
-            :key="`t-${node.id}`"
             :x="node.x"
             :y="node.y"
             dy="0.35em"
@@ -243,14 +257,9 @@ const lines = computed(() => {
   border-color: #aaa;
 }
 
-.heal-button {
-  background-color: #e63946;
-  border-color: #e63946;
-}
-
 .heal-button:hover {
-  background-color: #c9303d !important;
-  border-color: #c9303d !important;
+  background-color: #369422 !important;
+  border-color: #369422 !important;
 }
 
 .heal-button:disabled {
@@ -288,17 +297,43 @@ const lines = computed(() => {
   stroke-width: 0.5;
 }
 
-.nodes circle {
-  stroke: #1a1a1a;
-  stroke-width: 0.5;
+.node-group {
+  cursor: pointer;
+  transition: opacity 0.2s ease;
+}
+.node-group:hover:not(.is-loading) {
+  opacity: 0.7;
 }
 
-.labels text {
+.node-group:hover:not(.is-loading) circle {
+  fill: #c9303d !important;
+}
+
+.node-group:hover:not(.is-loading) text {
+  fill: #f7f3ed !important;
+}
+
+.node-group.is-loading {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.node-group circle {
+  stroke: #1a1a1a;
+  stroke-width: 0.5;
+  transition: fill 0.3s ease;
+}
+
+.node-group text {
   font-size: var(--node-font-size, 3px);
   font-family: sans-serif;
   fill: #f7f3ed;
   text-anchor: middle;
   pointer-events: none;
   user-select: none;
+}
+
+.node-group.is-dead text {
+  fill: #1a1a1a;
 }
 </style>
