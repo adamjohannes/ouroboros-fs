@@ -10,6 +10,7 @@ use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 #[derive(Debug)]
@@ -133,6 +134,26 @@ impl Gateway {
                 }
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
+
+            (method, path)
+                if method == "POST" && path.starts_with("/node/") && path.ends_with("/kill") =>
+            {
+                // Handle POST /node/<port>/kill
+                if let Some(port_str) = path
+                    .strip_prefix("/node/")
+                    .and_then(|p| p.strip_suffix("/kill"))
+                {
+                    match self.trigger_node_kill(port_str).await {
+                        Ok(msg) => {
+                            Self::send_json_response(writer, serde_json::json!({ "message": msg }))
+                                .await
+                        }
+                        Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
+                    }
+                } else {
+                    Self::send_error_response(writer, 400, "Bad Request: Malformed kill URL").await
+                }
+            }
             _ => Self::send_error_response(writer, 404, "Not Found").await,
         }
     }
@@ -411,6 +432,65 @@ impl Gateway {
             Ok(Err(e)) => Err(e.into()),
             Err(_) => Err("Gateway timed out waiting for NODE HEAL response".into()),
         }
+    }
+
+    /// Finds a process by port and kills it. (Unix-specific)
+    async fn trigger_node_kill(
+        &self,
+        port: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        tracing::info!(port = %port, "Gateway: Received request to kill node");
+
+        // 1. Find PID using lsof
+        let lsof_output = Command::new("lsof")
+            .arg(format!("-iTCP:{}", port))
+            .arg("-sTCP:LISTEN")
+            .arg("-n")
+            .arg("-P")
+            .arg("-t")
+            .output()
+            .await?;
+
+        if !lsof_output.status.success() {
+            tracing::warn!(port = %port, error = ?String::from_utf8_lossy(&lsof_output.stderr), "lsof command failed");
+            return Err(format!(
+                "lsof failed to find port {}: {}",
+                port,
+                String::from_utf8_lossy(&lsof_output.stderr)
+            )
+            .into());
+        }
+
+        let pid_str = String::from_utf8(lsof_output.stdout)?.trim().to_string();
+        if pid_str.is_empty() {
+            tracing::warn!(port = %port, "No process found listening on port");
+            return Err(format!("No process found on port {}", port).into());
+        }
+
+        // lsof might return multiple PIDs, just use the first line
+        let pid = pid_str.lines().next().unwrap_or("").trim();
+        if pid.is_empty() {
+            return Err(format!("No PID found on port {}", port).into());
+        }
+
+        // 2. Kill the PID
+        let kill_output = Command::new("kill")
+            .arg(pid) // Send SIGTERM
+            .output()
+            .await?;
+
+        if !kill_output.status.success() {
+            tracing::error!(port = %port, pid = %pid, error = ?String::from_utf8_lossy(&kill_output.stderr), "kill command failed");
+            return Err(format!(
+                "kill failed for PID {}: {}",
+                pid,
+                String::from_utf8_lossy(&kill_output.stderr)
+            )
+            .into());
+        }
+
+        tracing::info!(port = %port, pid = %pid, "Successfully sent kill signal to node");
+        Ok(format!("Killed node on port {} (PID: {})", port, pid))
     }
 
     // --- TCP HELPERS ---
