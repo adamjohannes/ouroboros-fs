@@ -103,11 +103,16 @@ const lines = computed(() => {
 
 <template>
   <div class="nodes-header">
-    <h3>Node Status</h3>
-    <small v-if="!store.nodesLoading">
-      Last Updated: {{ store.lastNodesUpdate }}
-    </small>
-    <small v-if="store.nodesLoading">Loading...</small>
+    <div>
+      <h3>Node Status</h3>
+      <small v-if="!store.nodesLoading">
+        Last Updated: {{ store.lastNodesUpdate }}
+      </small>
+      <small v-if="store.nodesLoading">Loading...</small>
+    </div>
+    <button @click="store.netmapGet" :disabled="store.nodesLoading">
+      {{ store.nodesLoading ? 'Refreshing...' : 'Refresh' }}
+    </button>
   </div>
   <svg
       :viewBox="`0 0 ${viewBox.width} ${viewBox.height}`"
@@ -151,11 +156,22 @@ const lines = computed(() => {
 
 <style scoped>
 .nodes-header {
-  text-align: center;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid #ccc;
 }
+
+.nodes-header h3 {
+  margin: 0;
+}
+
 .nodes-header small {
   color: #555;
+  font-size: 0.8em;
 }
+
 .nodes-graph {
   width: 100%;
   max-width: 600px;
