@@ -19,7 +19,7 @@ use crate::{
 type AnyErr = Box<dyn Error + Send + Sync>;
 
 /// Run the TCP server and handle connections.
-pub async fn run(bind_addr: &str, gossip_interval: Duration) -> Result<(), AnyErr> {
+pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64) -> Result<(), AnyErr> {
     // 1. Parse the address with an explicit type annotation
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
@@ -47,7 +47,7 @@ pub async fn run(bind_addr: &str, gossip_interval: Duration) -> Result<(), AnyEr
     let local = listener.local_addr()?;
 
     // Initialize Node structure
-    let node = Node::new(local.to_string(), gossip_interval);
+    let node = Node::new(local.to_string(), gossip_interval, file_size);
     tracing::info!(node = %node.port, "Node listening");
 
     // Create nodes/<port>/content and nodes/<port>/backup directories
@@ -709,6 +709,23 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Handle files larger than the node supports
+    if size > node.file_size {
+        tracing::error!(node = %node.port, file_name = %name, file_size = size, max_file_size = %node.file_size, "File size is too large");
+
+        let msg = format!(
+            "ERR File size is too large ({} > {})\n",
+            size, node.file_size
+        );
+        writer.write_all(msg.as_bytes()).await?;
+
+        // Drain the stream to consume the file body the client is sending
+        let mut sink = vec![0u8; size as usize];
+        reader.read_exact(&mut sink).await?;
+
+        return Ok(());
+    }
+
     let name = Path::new(&name)
         .file_name()
         .unwrap()

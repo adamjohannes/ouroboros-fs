@@ -55,12 +55,15 @@ pub struct Node {
     /// Time between gossip health checks
     pub gossip_interval: Duration,
 
+    /// Max file size.
+    pub file_size: u64,
+
     /// Map of `port -> next_port` for the entire ring
     pub topology_map: RwLock<HashMap<String, String>>,
 }
 
 impl Node {
-    pub fn new(port: String, gossip_interval: Duration) -> Arc<Self> {
+    pub fn new(port: String, gossip_interval: Duration, file_size: u64) -> Arc<Self> {
         let network_nodes = RwLock::new(HashMap::new());
 
         Arc::new(Self {
@@ -74,6 +77,7 @@ impl Node {
             network_nodes,
             file_tags: RwLock::new(HashMap::new()),
             gossip_interval,
+            file_size,
             topology_map: RwLock::new(HashMap::new()),
         })
     }

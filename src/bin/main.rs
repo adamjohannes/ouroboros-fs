@@ -27,9 +27,12 @@ enum Cmd {
         /// Provide only the port, and host defaults to 127.0.0.1
         #[arg(short, long)]
         port: Option<u16>,
-        /// Time (ms) between health checks to the next node. 0 to disable.
+        /// Time (ms) between health checks to the next node. 0 to disable. Defaults to 5 seconds.
         #[arg(long, default_value_t = 5000u64)]
         wait_time: u64,
+        /// Max file size in bytes. 0 to disable. Defaults to 1 gigabyte.
+        #[arg(short, long, default_value_t = 1_000_000_000u64)]
+        file_size: u64,
     },
 
     /// Spawn N nodes and stitch them into a ring
@@ -58,6 +61,9 @@ enum Cmd {
         /// Run the DNS Gateway on this port
         #[arg(long = "dns-port")]
         dns_port: Option<u16>,
+        /// Max file size in bytes. 0 to disable. Defaults to 1 gigabyte.
+        #[arg(short, long, default_value_t = 1_000_000_000u64)]
+        file_size: u64,
     },
 }
 
@@ -76,10 +82,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             addr,
             port,
             wait_time,
+            file_size,
         } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
-            run(&bind, gossip_interval).await
+            run(&bind, gossip_interval, file_size).await
         }
         Cmd::SetNetwork {
             nodes,
@@ -90,6 +97,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             wait_time,
             overwrite_nodes_dir,
             dns_port,
+            file_size,
         } => {
             set_network(
                 nodes,
@@ -100,6 +108,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 wait_time,
                 overwrite_nodes_dir,
                 dns_port,
+                file_size,
             )
             .await
         }
@@ -146,6 +155,7 @@ async fn set_network(
     wait_time: u64,
     overwrite_nodes_dir: bool,
     dns_port: Option<u16>,
+    max_file_size: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if nodes == 0 {
         tracing::warn!("--nodes must be >= 1");
@@ -196,7 +206,9 @@ async fn set_network(
             .arg("--addr")
             .arg(&addr)
             .arg("--wait-time")
-            .arg(wait_time.to_string());
+            .arg(wait_time.to_string())
+            .arg("--file-size")
+            .arg(max_file_size.to_string());
 
         let child = cmd.spawn()?;
         children.push(child);
