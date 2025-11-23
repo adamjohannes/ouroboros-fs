@@ -160,7 +160,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     }
 }
 
-/* --- Noun parsers --- */
+// --- Noun parsers
 
 fn parse_node_cmd(rest: &str) -> Result<Command, String> {
     if let Some(addr) = rest.strip_prefix("NEXT ") {

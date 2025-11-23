@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 }
 
-/* ------------------------- run -------------------------- */
+// --- run
 
 fn resolve_listen_addr(addr: Option<String>, port: Option<u16>) -> String {
     // Priority:
@@ -144,7 +144,7 @@ fn normalize_addr(raw: String) -> String {
     }
 }
 
-/* -------------------------- set-network ------------------------- */
+// --- set-network
 
 async fn set_network(
     nodes: u16,
@@ -345,7 +345,7 @@ async fn send_node_next(
     let mut buf = String::new();
     let read = tokio::time::timeout(Duration::from_millis(150), reader.read_line(&mut buf)).await;
     if read.is_err() {
-        // It's okay if the ACK races, we still consider wiring successful
+        // It's okay if the ACK races, we still consider the wiring successful
         return Ok(());
     }
     let ack = buf.trim();

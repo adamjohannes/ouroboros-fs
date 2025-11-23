@@ -244,7 +244,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
     Ok(())
 }
 
-/* --- Command handlers --- */
+// --- Command handlers
 
 async fn handle_node_next<W: AsyncWrite + Unpin>(
     node: &Node,
@@ -565,7 +565,7 @@ async fn handle_topology_set<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* -------- NETMAP -------- */
+// --- NETMAP
 
 async fn handle_netmap_discover<W: AsyncWrite + Unpin>(
     node: &Node,
@@ -676,7 +676,7 @@ async fn handle_netmap_get<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* -------- FILE CHUNKING helpers -------- */
+// --- FILE CHUNKING helpers
 
 fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
     // Distribute remainder to the first (total_size % parts) chunks
@@ -696,7 +696,7 @@ fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
     format!("{}.part-{:03}-of-{:03}", safe, index + 1, parts)
 }
 
-/* -------- FILE: PUSH / HOP handlers -------- */
+// --- FILE: PUSH / HOP handlers
 
 async fn handle_file_push<R, W>(
     node: Arc<Node>,
@@ -955,7 +955,7 @@ async fn handle_file_tags_set<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* -------- FILE RETRIEVAL (PULL / GET-CHUNK) -------- */
+// --- FILE RETRIEVAL (PULL / GET-CHUNK)
 
 async fn handle_file_pull<W: AsyncWrite + Unpin>(
     node: &Node,
@@ -1005,7 +1005,7 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* -------- BACKUP HANDLERS -------- */
+// --- BACKUP HANDLERS
 
 /// Handles "FILE NOTIFY-CHUNK-SAVED <name>"
 /// This node is the predecessor (i). It is being notified by its successor (i+1).
@@ -1151,7 +1151,7 @@ async fn handle_file_get_backup_chunk<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* --- PULL helpers --- */
+// --- PULL helpers
 
 async fn pull_file_from_ring(
     node: &Node,
@@ -1350,7 +1350,7 @@ async fn request_backup_chunk_from(
     Ok((buf, next_addr))
 }
 
-/* -------- FILE LIST -------- */
+// --- FILE LIST
 
 async fn handle_file_list_csv<W: AsyncWrite + Unpin>(
     node: &Node,
@@ -1373,7 +1373,7 @@ async fn handle_file_list_csv<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* --- Helpers and Errors --- */
+// --- Helpers
 
 async fn handle_error<W: AsyncWrite + Unpin>(writer: &mut W, err: String) -> Result<(), AnyErr> {
     writer
@@ -1445,7 +1445,7 @@ fn host_of(addr: &str) -> &str {
     }
 }
 
-/* --- BACKUP HELPERS --- */
+// --- Backup Helpers
 
 /// Helper to find the predecessor node from the topology map
 async fn get_predecessor_addr(node: &Node) -> Option<String> {
@@ -1520,7 +1520,7 @@ async fn request_chunk_for_backup(addr: &str, name: &str) -> Result<Vec<u8>, Any
     Ok(buf)
 }
 
-/* --- Gossip and Healing Functions --- */
+// --- Gossip and Healing Functions
 
 /// The main gossip loop task
 async fn spawn_gossip_loop(node: Arc<Node>) {

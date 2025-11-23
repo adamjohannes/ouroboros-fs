@@ -103,7 +103,7 @@ impl Node {
         Ok(())
     }
 
-    /* ---------------- FILE TAGS ---------------- */
+    // File Tags
 
     pub async fn set_file_tag(&self, name: &str, start_port: u16, size: u64, parts: u32) {
         self.file_tags.write().await.insert(
@@ -158,7 +158,7 @@ impl Node {
         }
     }
 
-    /* ---------------- TOPOLOGY (WALK) helpers ---------------- */
+    // --- Topology (WALK) helpers
 
     fn next_token(&self) -> String {
         let n = self.walk_counter.fetch_add(1, Ordering::Relaxed);
@@ -231,7 +231,7 @@ impl Node {
         Ok(())
     }
 
-    /* ---------------- FILE helpers ---------------- */
+    // --- FILE helpers
 
     fn next_file_token(&self) -> String {
         let n = self.file_counter.fetch_add(1, Ordering::Relaxed);
@@ -281,7 +281,7 @@ impl Node {
     }
 }
 
-/* ---------- WALK utility ---------- */
+// --- WALK utility
 
 pub fn port_str(addr: &str) -> &str {
     addr.rsplit(':').next().unwrap_or(addr)
@@ -307,7 +307,7 @@ impl Node {
     }
 }
 
-/* ---------- NETMAP (INVESTIGATION) helpers ---------- */
+// --- NETMAP (INVESTIGATION) helpers
 
 fn host_str(addr: &str) -> &str {
     addr.split(':').next().unwrap_or("127.0.0.1")
@@ -435,7 +435,7 @@ impl Node {
     }
 }
 
-/* ---------- Gossip/Topology helpers ---------- */
+// --- Gossip/Topology helpers
 impl Node {
     pub async fn update_node_status(&self, port: String, status: NodeStatus) {
         self.network_nodes.write().await.insert(port, status);

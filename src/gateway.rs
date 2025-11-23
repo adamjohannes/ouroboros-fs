@@ -82,7 +82,7 @@ impl Gateway {
         Ok(())
     }
 
-    // --- HTTP HANDLER ---
+    // --- HTTP Handler
 
     async fn handle_http_request<R>(
         self: Arc<Self>,
@@ -270,7 +270,7 @@ impl Gateway {
         Ok(())
     }
 
-    // --- TCP PROXY HANDLER ---
+    // --- Raw TCP Handler
 
     /// This is the proxy for all TCP commands
     async fn handle_tcp_proxy<R>(
@@ -310,7 +310,7 @@ impl Gateway {
         Ok(())
     }
 
-    // --- API DATA FETCHERS ---
+    // --- API Data Fetchers
 
     /// Sends a "NODE PING" to a single address and returns its status.
     ///
@@ -493,7 +493,7 @@ impl Gateway {
         Ok(format!("Killed node on port {} (PID: {})", port, pid))
     }
 
-    // --- TCP HELPERS ---
+    // --- TCP Helpers
 
     /// Tries all node addresses and returns a stream to the first one that connects.
     async fn connect_to_ring(&self) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
@@ -505,7 +505,7 @@ impl Gateway {
         Err("Could not connect to any node in the ring".into())
     }
 
-    // --- HTTP HELPERS ---
+    // --- HTTP Helpers
 
     /// Sends a 204 No Content response for OPTIONS preflight requests
     async fn send_options_response(writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
