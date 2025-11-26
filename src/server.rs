@@ -888,7 +888,7 @@ where
         return Ok(());
     }
 
-    // Compute my chunk length and read exactly those bytes
+    // Compute the chunk length and read exactly those bytes
     let my_len = fair_chunk_len(index, file_size, parts);
     let mut buf = vec![0u8; my_len as usize];
     reader.read_exact(&mut buf).await?;
