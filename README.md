@@ -39,6 +39,7 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
 4. [Protocol Overview](#4-protocol-overview)
    1. [Client Commands](#41-client-commands)
    2. [Internal (Node-to-Node) Commands](#42-internal-node-to-node-commands)
+5. [Test Coverage](#5-test-coverage)
 
 ## 1. Core Features
 
@@ -335,3 +336,49 @@ These commands are used by the nodes to communicate with each other.
   backup. Followed by exactly `<size>` raw bytes; receiver replies `OK\n`.
 - **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
   `/backup` directory. Used by `FILE PULL` as a failover.
+
+---
+
+## 5. Test Coverage
+
+OuroborosFS measures coverage with [`cargo-llvm-cov`]. The default suite (`cargo test`) is what the
+coverage job in CI measures; the `#[ignore]`d `heal_subprocess` test exercises the binary-respawn
+path under real child processes and is excluded from the headline numbers.
+
+### Local
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+
+cargo llvm-cov                           # console summary
+cargo llvm-cov --html                    # writes target/llvm-cov/html/index.html
+cargo llvm-cov --lcov --output-path lcov.info
+```
+
+To exercise the gaps below (non-default — measured separately):
+
+```bash
+cargo test --release -- --ignored heal_subprocess
+```
+
+### CI
+
+`.github/workflows/build_and_test_release_release.yml` defines a `coverage` job that runs on every
+push and pull-request to `main` and uploads `lcov.info` as a build artifact named `lcov`. A floor
+will be added in a follow-up once a measured baseline exists.
+
+### Gaps reflected in the metric
+
+- `src/server.rs::handle_node_death` lines 1644-1685 (binary-respawn + `share_data_with_new_node`)
+  are reached only by the ignored `heal_subprocess::full_heal_respawns_dead_child_and_broadcasts`
+  test. The in-process integration harness sets `respawn_dead=false` so killing a node doesn't
+  exec a real binary that survives the test runtime.
+- `src/gateway.rs::trigger_node_kill` is Unix-specific (`lsof`/`kill`). The
+  `gateway_post_kill_unknown_port_returns_500` test covers the failure branch only; the success
+  branch isn't hit by the in-process suite.
+- `src/gateway.rs::handle_tcp_proxy` has a known deadlock with the current `try_join!` strategy
+  (see `tests/gateway_http.rs::gateway_tcp_proxy_*` — `#[ignore]`d). The two passthrough tests
+  are pinned for after the proxy fix.
+
+[`cargo-llvm-cov`]: https://github.com/taiki-e/cargo-llvm-cov
