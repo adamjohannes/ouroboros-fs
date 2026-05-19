@@ -611,4 +611,234 @@ mod tests {
     fn lowercase_noun_normalized() {
         assert_eq!(parse_line("node status").unwrap(), Command::NodeStatus);
     }
+
+    // --- Named negative cases. Each pins one specific failure mode so a
+    //     regression points at the offending input directly.
+
+    #[test]
+    fn parse_unknown_namespace_reports_namespace_in_err() {
+        let err = parse_line("BLAH foo").unwrap_err();
+        assert!(err.contains("BLAH"), "err missing namespace: {err}");
+    }
+
+    #[test]
+    fn whitespace_only_line_errs() {
+        assert!(parse_line("   \r\n").is_err());
+    }
+
+    #[test]
+    fn tab_separators_not_supported() {
+        // The parser splits on a literal space; tabs are not treated as
+        // delimiters. So `NODE\tNEXT addr` becomes noun = "NODE\tNEXT"
+        // (uppercased) and is rejected as an unknown namespace.
+        assert!(parse_line("NODE\tNEXT 127.0.0.1:7000").is_err());
+    }
+
+    // NODE
+    #[test]
+    fn node_next_missing_addr_errs() {
+        assert!(parse_line("NODE NEXT").is_err());
+    }
+
+    #[test]
+    fn node_next_only_whitespace_errs() {
+        assert!(parse_line("NODE NEXT   ").is_err());
+    }
+
+    #[test]
+    fn node_heal_hop_missing_start_addr_errs() {
+        assert!(parse_line("NODE HEAL-HOP tok").is_err());
+    }
+
+    #[test]
+    fn node_heal_hop_missing_token_errs() {
+        // Empty token before the addr → both fields blank/start_addr empty.
+        assert!(parse_line("NODE HEAL-HOP   addr").is_err());
+    }
+
+    #[test]
+    fn node_heal_done_missing_token_errs() {
+        assert!(parse_line("NODE HEAL-DONE").is_err());
+    }
+
+    #[test]
+    fn node_unknown_verb_errs() {
+        assert!(parse_line("NODE FROBNICATE 1 2").is_err());
+    }
+
+    // RING
+    #[test]
+    fn ring_forward_missing_ttl_errs() {
+        assert!(parse_line("RING FORWARD").is_err());
+    }
+
+    #[test]
+    fn ring_forward_zero_ttl_parses() {
+        match parse_line("RING FORWARD 0 ").unwrap() {
+            Command::RingForward { ttl, msg } => {
+                assert_eq!(ttl, 0);
+                assert_eq!(msg, "");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_forward_overflow_ttl_errs() {
+        // 9999999999999999 > u32::MAX (~4.3e9).
+        assert!(parse_line("RING FORWARD 9999999999999999 m").is_err());
+    }
+
+    #[test]
+    fn ring_forward_msg_with_spaces_kept_intact() {
+        match parse_line("RING FORWARD 3 a b c d").unwrap() {
+            Command::RingForward { ttl, msg } => {
+                assert_eq!(ttl, 3);
+                assert_eq!(msg, "a b c d");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // TOPOLOGY
+    #[test]
+    fn topology_hop_empty_history_ok() {
+        // First-hop degenerate case: history is empty when only token + start
+        // are provided.
+        match parse_line("TOPOLOGY HOP tok addr ").unwrap() {
+            Command::TopologyHop {
+                token,
+                start_addr,
+                history,
+            } => {
+                assert_eq!(token, "tok");
+                assert_eq!(start_addr, "addr");
+                assert_eq!(history, "");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topology_hop_missing_start_errs() {
+        assert!(parse_line("TOPOLOGY HOP tok").is_err());
+    }
+
+    #[test]
+    fn topology_done_missing_token_errs() {
+        assert!(parse_line("TOPOLOGY DONE").is_err());
+    }
+
+    #[test]
+    fn topology_set_empty_history_parses() {
+        // The "SET " prefix matches with a trailing space; history is empty.
+        match parse_line("TOPOLOGY SET ").unwrap() {
+            Command::TopologySet { history } => assert_eq!(history, ""),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topology_unknown_verb_errs() {
+        assert!(parse_line("TOPOLOGY MARCH").is_err());
+    }
+
+    // NETMAP
+    #[test]
+    fn netmap_hop_missing_start_errs() {
+        assert!(parse_line("NETMAP HOP tok").is_err());
+    }
+
+    #[test]
+    fn netmap_done_missing_token_errs() {
+        assert!(parse_line("NETMAP DONE").is_err());
+    }
+
+    #[test]
+    fn netmap_set_empty_payload() {
+        match parse_line("NETMAP SET ").unwrap() {
+            Command::NetmapSet { entries } => assert_eq!(entries, ""),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn netmap_unknown_verb_errs() {
+        assert!(parse_line("NETMAP MAYBE").is_err());
+    }
+
+    // FILE
+    #[test]
+    fn file_push_zero_size_parses() {
+        match parse_line("FILE PUSH 0 name").unwrap() {
+            Command::FilePush { size, name } => {
+                assert_eq!(size, 0);
+                assert_eq!(name, "name");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_push_negative_size_errs() {
+        assert!(parse_line("FILE PUSH -1 n").is_err());
+    }
+
+    #[test]
+    fn file_push_no_name_errs() {
+        assert!(parse_line("FILE PUSH 100").is_err());
+    }
+
+    #[test]
+    fn file_push_huge_size_max_u64_parses() {
+        // The parser accepts the literal; the handler is responsible for
+        // rejecting it via the file_size cap. See safety::oversized_*.
+        match parse_line("FILE PUSH 18446744073709551615 evil").unwrap() {
+            Command::FilePush { size, name } => {
+                assert_eq!(size, u64::MAX);
+                assert_eq!(name, "evil");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_pull_only_spaces_errs() {
+        assert!(parse_line("FILE PULL    ").is_err());
+    }
+
+    #[test]
+    fn file_get_chunk_empty_errs() {
+        assert!(parse_line("FILE GET-CHUNK ").is_err());
+    }
+
+    #[test]
+    fn file_backup_push_no_size_errs() {
+        assert!(parse_line("FILE BACKUP-PUSH name").is_err());
+    }
+
+    #[test]
+    fn file_get_backup_chunk_empty_errs() {
+        assert!(parse_line("FILE GET-BACKUP-CHUNK   ").is_err());
+    }
+
+    #[test]
+    fn file_push_chunk_six_fields_required() {
+        // Only 5 fields → the 6th (start_port) is empty → numeric parse fails.
+        assert!(parse_line("FILE PUSH-CHUNK n 1 2 3 0").is_err());
+    }
+
+    #[test]
+    fn file_push_chunk_index_out_of_range_parses_handler_rejects() {
+        // index=5 with parts=1 is logically invalid, but the parser accepts
+        // it (parser-level validation is type-checking only). The handler
+        // is the layer that rejects with `ERR bad FILE PUSH-CHUNK index`.
+        let cmd = parse_line("FILE PUSH-CHUNK n 1 1 1 5 7000").unwrap();
+        assert!(matches!(cmd, Command::FilePushChunk { .. }));
+    }
+
+    #[test]
+    fn file_unknown_verb_errs() {
+        assert!(parse_line("FILE WIBBLE foo").is_err());
+    }
 }

@@ -1881,4 +1881,93 @@ mod tests {
         // future fix changes it.
         assert_eq!(host_of("[::1]:7000"), "[");
     }
+
+    // --- Additional edge-case anchors
+
+    #[test]
+    fn fair_chunk_len_size_lt_parts_distributes_one_per_first_size_chunks() {
+        // 3 bytes across 5 parts: first 3 chunks get 1 byte each, last 2
+        // get 0 (the empty-chunk path that the relay handler must skip).
+        let parts = 5u32;
+        let size = 3u64;
+        let lens: Vec<u64> = (0..parts).map(|i| fair_chunk_len(i, size, parts)).collect();
+        assert_eq!(lens, vec![1, 1, 1, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn fair_chunk_len_parts_zero_panics() {
+        // parts=0 triggers division-by-zero (u64 / 0). Pinning the
+        // precondition: callers must enforce parts >= 1 (handle_file_push
+        // does, via `network_size().await as u32`).
+        let _ = fair_chunk_len(0, 100, 0);
+    }
+
+    #[test]
+    fn chunk_file_name_zero_pads_3_digits_at_boundary() {
+        // 100 chunks: index 99 maps to part 100 of 100, three-digit field.
+        assert_eq!(
+            chunk_file_name("x", 99, 100),
+            "x.part-100-of-100"
+        );
+    }
+
+    #[test]
+    fn chunk_file_name_separator_format_pinned() {
+        // The exact format `<safe>.part-NNN-of-MMM` is the contract that
+        // handle_file_push_chunk relies on when recovering the parent name
+        // via rsplit_once(".part-"). A change here breaks PULL.
+        let n = chunk_file_name("foo.bin", 0, 3);
+        assert_eq!(n, "foo.bin.part-001-of-003");
+    }
+
+    #[test]
+    fn chunk_name_roundtrip_via_rsplit_once_part() {
+        // The mirror invariant: parent recovery from chunk name.
+        let chunk = chunk_file_name("foo.bin", 1, 3);
+        let (parent, _) = chunk.rsplit_once(".part-").unwrap();
+        assert_eq!(parent, "foo.bin");
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_pipe_and_backslash() {
+        assert_eq!(sanitize_filename("a|b"), "a_b");
+        assert_eq!(sanitize_filename("a\\b"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_filename_idempotent_on_safe_input() {
+        let s = "already-safe.bin";
+        assert_eq!(sanitize_filename(s), s);
+        assert_eq!(sanitize_filename(&sanitize_filename(s)), s);
+    }
+
+    #[test]
+    fn csv_escape_quote_doubling() {
+        // The doubled-quote contract used by handle_file_list_csv.
+        assert_eq!(csv_escape("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn csv_escape_carriage_return_quoted() {
+        // The `\r` predicate branch in csv_escape.
+        assert_eq!(csv_escape("a\rb"), "\"a\rb\"");
+    }
+
+    #[test]
+    fn csv_escape_no_special_chars_returns_input_string() {
+        assert_eq!(csv_escape("plain-name.bin"), "plain-name.bin");
+    }
+
+    #[test]
+    fn host_of_empty_string_falls_back() {
+        // Empty input has no colon → fallback branch.
+        assert_eq!(host_of(""), "127.0.0.1");
+    }
+
+    #[test]
+    fn host_of_localhost_with_port() {
+        // Named anchor for the literal-host-name case.
+        assert_eq!(host_of("localhost:7000"), "localhost");
+    }
 }

@@ -474,7 +474,25 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_edge, port_str};
+    use super::{Node, append_edge, host_str, parse_entries, port_str, serialize_entries};
+    use crate::NodeStatus;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// Build a Node suitable for unit tests. Uses a tempdir-style storage
+    /// path that's never written to (no Node method here actually creates
+    /// files), gossip disabled, respawn disabled.
+    fn test_node(port: &str) -> std::sync::Arc<Node> {
+        Node::new(
+            port.to_string(),
+            Duration::ZERO,
+            1 << 30,
+            PathBuf::from("/tmp/ouroboros_unit_unused"),
+            false,
+        )
+    }
 
     #[test]
     fn port_str_ipv4() {
@@ -514,5 +532,279 @@ mod tests {
             "127.0.0.1:7002",
         );
         assert_eq!(h, "7000->7001;7001->7002");
+    }
+
+    // --- host_str (private fn): pinned for documentation parity with
+    //     server.rs::host_of. host_str splits on the first colon.
+
+    #[test]
+    fn host_str_ipv4() {
+        assert_eq!(host_str("127.0.0.1:7000"), "127.0.0.1");
+    }
+
+    #[test]
+    fn host_str_no_colon_returns_input() {
+        // `addr.split(':').next()` always yields the input on non-empty
+        // strings; the `unwrap_or("127.0.0.1")` fallback is only reached
+        // when split returns None — which never happens. So a colon-less
+        // input is returned verbatim.
+        assert_eq!(host_str("foo"), "foo");
+    }
+
+    #[test]
+    fn host_str_empty_returns_empty() {
+        // Documents that the "127.0.0.1" fallback path in the source is
+        // effectively unreachable: split on an empty string yields a
+        // single empty chunk, not None, so we get "" not "127.0.0.1".
+        assert_eq!(host_str(""), "");
+    }
+
+    #[test]
+    fn host_str_ipv6_brackets_known_gap() {
+        // Mirrors the `host_of_ipv6_bracket_pin` in server.rs — the simple
+        // `split(':')` strategy doesn't handle IPv6 brackets. Pinning the
+        // current behavior so a future fix has a visible regression target.
+        assert_eq!(host_str("[::1]:7000"), "[");
+    }
+
+    // --- parse_entries / serialize_entries
+
+    #[test]
+    fn parse_entries_alive_dead_mixed() {
+        let m = parse_entries("7000=Alive,7001=Dead");
+        assert_eq!(m.get("7000"), Some(&NodeStatus::Alive));
+        assert_eq!(m.get("7001"), Some(&NodeStatus::Dead));
+        assert_eq!(m.len(), 2);
+        // Lowercase variants accepted.
+        let m2 = parse_entries("7002=alive,7003=dead");
+        assert_eq!(m2.get("7002"), Some(&NodeStatus::Alive));
+        assert_eq!(m2.get("7003"), Some(&NodeStatus::Dead));
+    }
+
+    #[test]
+    fn parse_entries_unknown_status_defaults_alive() {
+        // The parser is lenient: an unrecognized status falls back to Alive.
+        let m = parse_entries("7000=Maybe");
+        assert_eq!(m.get("7000"), Some(&NodeStatus::Alive));
+    }
+
+    #[test]
+    fn parse_entries_skips_empty_and_keyless() {
+        // Trailing comma, double comma, "=Alive" (empty key) all silently dropped.
+        let m = parse_entries("7000=Alive,,=Alive,7001=Dead,");
+        assert_eq!(m.len(), 2);
+        assert!(m.contains_key("7000"));
+        assert!(m.contains_key("7001"));
+    }
+
+    #[test]
+    fn parse_entries_handles_whitespace() {
+        let m = parse_entries(" 7000 = Alive , 7001 = Dead ");
+        assert_eq!(m.get("7000"), Some(&NodeStatus::Alive));
+        assert_eq!(m.get("7001"), Some(&NodeStatus::Dead));
+    }
+
+    #[test]
+    fn serialize_entries_sorted_by_key() {
+        let mut m: HashMap<String, NodeStatus> = HashMap::new();
+        m.insert("7002".into(), NodeStatus::Alive);
+        m.insert("7000".into(), NodeStatus::Dead);
+        m.insert("7001".into(), NodeStatus::Alive);
+        // Ordering is deterministic regardless of insertion order.
+        assert_eq!(serialize_entries(&m), "7000=Dead,7001=Alive,7002=Alive");
+    }
+
+    #[test]
+    fn serialize_entries_empty_map() {
+        let m: HashMap<String, NodeStatus> = HashMap::new();
+        assert_eq!(serialize_entries(&m), "");
+    }
+
+    #[test]
+    fn parse_serialize_roundtrip() {
+        let mut m: HashMap<String, NodeStatus> = HashMap::new();
+        for (k, v) in [
+            ("7000", NodeStatus::Alive),
+            ("7001", NodeStatus::Dead),
+            ("7002", NodeStatus::Alive),
+            ("7003", NodeStatus::Alive),
+            ("7004", NodeStatus::Dead),
+        ] {
+            m.insert(k.into(), v);
+        }
+        let s = serialize_entries(&m);
+        let m2 = parse_entries(&s);
+        assert_eq!(m2, m);
+    }
+
+    // --- entries_with_self / update_node_status / get_network_nodes_lines
+
+    #[tokio::test]
+    async fn entries_with_self_inserts_self() {
+        let node = test_node("127.0.0.1:7000");
+        let out = node.entries_with_self("7001=Alive");
+        // Sorted output, so 7000 appears first.
+        assert_eq!(out, "7000=Alive,7001=Alive");
+    }
+
+    #[tokio::test]
+    async fn entries_with_self_overwrites_self_to_alive() {
+        let node = test_node("127.0.0.1:7000");
+        // Even if the input claims we're Dead, the local entry is forced to Alive
+        // (the only authoritative source for "this node is Alive" is the node itself).
+        let out = node.entries_with_self("7000=Dead,7001=Alive");
+        assert_eq!(out, "7000=Alive,7001=Alive");
+    }
+
+    #[tokio::test]
+    async fn update_node_status_then_get_lines() {
+        let node = test_node("127.0.0.1:7000");
+        node.update_node_status("7001".into(), NodeStatus::Dead).await;
+        let lines = node.get_network_nodes_lines().await;
+        assert_eq!(lines, vec!["7001=Dead"]);
+    }
+
+    #[tokio::test]
+    async fn get_network_nodes_lines_empty_returns_empty_vec() {
+        let node = test_node("127.0.0.1:7000");
+        let lines = node.get_network_nodes_lines().await;
+        assert!(lines.is_empty());
+    }
+
+    // --- topology_map round-trip
+
+    #[tokio::test]
+    async fn set_topology_from_history_basic() {
+        let node = test_node("127.0.0.1:7000");
+        node.set_topology_from_history("7000->7001;7001->7002").await;
+        let m = node.topology_map.read().await;
+        assert_eq!(m.get("7000"), Some(&"7001".to_string()));
+        assert_eq!(m.get("7001"), Some(&"7002".to_string()));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_topology_from_history_clears_previous() {
+        let node = test_node("127.0.0.1:7000");
+        node.set_topology_from_history("7000->7001").await;
+        node.set_topology_from_history("9000->9001").await;
+        let m = node.topology_map.read().await;
+        // Old edge is gone; only the new one remains.
+        assert!(!m.contains_key("7000"));
+        assert_eq!(m.get("9000"), Some(&"9001".to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_topology_from_history_skips_malformed() {
+        let node = test_node("127.0.0.1:7000");
+        node.set_topology_from_history("7000->7001;garbage;7001->7002").await;
+        let m = node.topology_map.read().await;
+        assert_eq!(m.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_topology_from_history_empty_string_is_noop_clear() {
+        let node = test_node("127.0.0.1:7000");
+        node.set_topology_from_history("7000->7001").await;
+        node.set_topology_from_history("").await;
+        let m = node.topology_map.read().await;
+        assert!(m.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topology_history_roundtrip() {
+        let node = test_node("127.0.0.1:7000");
+        let original = "7000->7001;7001->7002;7002->7000";
+        node.set_topology_from_history(original).await;
+        let s = node.get_topology_history().await;
+        // Round-trip via canonical sort-by-from. Original is already sorted.
+        assert_eq!(s, original);
+    }
+
+    // --- file_tags round-trip
+
+    #[tokio::test]
+    async fn set_file_tags_from_entries_basic() {
+        let node = test_node("127.0.0.1:7000");
+        node.set_file_tags_from_entries("a:7000:1024:3;b:7001:2048:5").await;
+        let tags = node.file_tags.read().await;
+        let a = tags.get("a").unwrap();
+        assert_eq!(a.start, 7000);
+        assert_eq!(a.size, 1024);
+        assert_eq!(a.parts, 3);
+        let b = tags.get("b").unwrap();
+        assert_eq!(b.start, 7001);
+        assert_eq!(b.size, 2048);
+        assert_eq!(b.parts, 5);
+    }
+
+    #[tokio::test]
+    async fn set_file_tags_from_entries_skips_bad_arity() {
+        // "a:1:2" only has 3 fields; should be silently dropped.
+        let node = test_node("127.0.0.1:7000");
+        node.set_file_tags_from_entries("a:1:2;b:7001:2048:5").await;
+        let tags = node.file_tags.read().await;
+        assert!(!tags.contains_key("a"));
+        assert!(tags.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn set_file_tags_from_entries_skips_bad_numerics() {
+        let node = test_node("127.0.0.1:7000");
+        node.set_file_tags_from_entries("a:notnum:1:1;b:7001:2048:5").await;
+        let tags = node.file_tags.read().await;
+        assert!(!tags.contains_key("a"));
+        assert!(tags.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn file_tags_entries_roundtrip() {
+        let node = test_node("127.0.0.1:7000");
+        let original = "alpha:7000:100:2;beta:7001:200:3";
+        node.set_file_tags_from_entries(original).await;
+        let s = node.get_file_tags_entries().await;
+        // Canonical form is sort-by-name, which alpha/beta already satisfy.
+        assert_eq!(s, original);
+    }
+
+    #[tokio::test]
+    async fn file_tags_entries_sanitizes_separators() {
+        // Names containing ':' or ';' get the offending chars replaced with '_'
+        // on serialize, so the output is a *valid* round-trippable string but
+        // the original name is not preserved verbatim.
+        let node = test_node("127.0.0.1:7000");
+        node.set_file_tag("a:b;c", 7000, 1, 1).await;
+        let s = node.get_file_tags_entries().await;
+        assert!(!s.contains("a:b;c"));
+        assert!(s.starts_with("a_b_c:7000:1:1"));
+    }
+
+    // --- forward_ring_forward / broadcast_netmap[_update]
+
+    #[tokio::test]
+    async fn forward_ring_forward_no_next_is_noop() {
+        // No next set; forward should silently succeed without attempting
+        // any TCP connection.
+        let node = test_node("127.0.0.1:7000");
+        let res = node.forward_ring_forward(0, "msg").await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn broadcast_netmap_no_other_hosts_is_noop() {
+        // The only entry is self; the loop's self-skip means no TCP attempts.
+        let node = test_node("127.0.0.1:7000");
+        node.broadcast_netmap("7000=Alive").await;
+        // No assertion needed beyond "did not hang or panic"; the counter
+        // assertion is in the next test and covers broadcast_netmap_update.
+    }
+
+    #[tokio::test]
+    async fn broadcast_netmap_update_increments_counter() {
+        let node = test_node("127.0.0.1:7000");
+        let before = node.netmap_broadcasts.load(Ordering::Relaxed);
+        node.broadcast_netmap_update().await;
+        let after = node.netmap_broadcasts.load(Ordering::Relaxed);
+        assert_eq!(after - before, 1);
     }
 }
