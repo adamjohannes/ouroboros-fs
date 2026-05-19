@@ -43,3 +43,21 @@ jobs:
       # Floor enforcement is intentionally deferred. Once the baseline
       # has been observed in CI a few times, a follow-up PR adds
       # `cargo llvm-cov report --fail-under-lines <baseline - 2>` here.
+
+  # PR-only "all tests" job. Runs the default suite *plus* the unstuck
+  # `#[ignore]`d tests (large-file streaming round-trip, subprocess heal).
+  # The two `gateway_tcp_proxy_*` ignored tests are deliberately skipped:
+  # they're pinned to a known deadlock in handle_tcp_proxy and would hang
+  # the job. See README §5 "Gaps reflected in the metric" and the
+  # documentation block in tests/gateway_http.rs.
+  pr_full_tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (release)
+        run: cargo build --release --verbose
+      - name: Run default suite
+        run: cargo test --release --verbose
+      - name: Run unstuck ignored tests (heal subprocess + 100 MB streaming)
+        run: cargo test --release -- --ignored full_heal large_file_streaming

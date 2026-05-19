@@ -368,6 +368,12 @@ cargo test --release -- --ignored heal_subprocess
 push and pull-request to `main` and uploads `lcov.info` as a build artifact named `lcov`. A floor
 will be added in a follow-up once a measured baseline exists.
 
+A separate `pr_full_tests` job runs **only on pull-requests targeting `main`**. It runs the default
+suite plus the unstuck `#[ignore]`d tests (`heal_subprocess::full_heal_*` and
+`large_file_streaming_100mb`) so PR authors get a regression signal on the slow paths the
+default-on-push suite skips. The two `gateway_tcp_proxy_*` ignored tests are deliberately not
+included — they're pinned to a known deadlock and would hang the job.
+
 ### Gaps reflected in the metric
 
 - `src/server.rs::handle_node_death` lines 1644-1685 (binary-respawn + `share_data_with_new_node`)
