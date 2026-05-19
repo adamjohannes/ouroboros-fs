@@ -33,15 +33,13 @@
 //!   - "FILE TAGS-SET <entries>" (node -> node)
 //!
 //! FILE (internal)
-//!   - "FILE RELAY-BLOB <token> <start_addr> <size> <name>"
-//!   - "FILE RELAY-STREAM <token> <start> <file_size> <parts> <index> <name>"
+//!   - "FILE PUSH-CHUNK <name> <chunk_size> <file_size> <parts> <index> <start_port>"
 //!   - "FILE GET-CHUNK <name>"                (node -> node)
 //!   - "FILE RESP-CHUNK <next_addr> <size> <name>"
 //!
 //! FILE (backup)
-//!   - "FILE NOTIFY-CHUNK-SAVED <name>"   (node -> predecessor node)
-//!   - "FILE GET-CHUNK-FOR-BACKUP <name>" (predecessor node -> node)
-//!   - "FILE GET-BACKUP-CHUNK <name>"     (node -> node, for PULL failover)
+//!   - "FILE BACKUP-PUSH <name> <size>"  (node -> predecessor; raw bytes follow)
+//!   - "FILE GET-BACKUP-CHUNK <name>"    (PULL failover: backup-holder serves)
 //!
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
@@ -113,31 +111,33 @@ pub enum Command {
     },
 
     // FILE (internal)
-    FileRelayBlob {
-        token: String,
-        start_addr: String,
-        size: u64,
+    /// Start node fans this command out to each chunk's owner concurrently.
+    /// Replaces the older RELAY-STREAM chain (one connection per node along
+    /// the ring). Receiver reads exactly `chunk_size` bytes from the
+    /// connection and saves them as `<name>.part-<index+1>-of-<parts>`.
+    /// `start_port` lets the receiver tag the file locally with the right
+    /// origin port for FILE LIST / file_tags propagation.
+    FilePushChunk {
         name: String,
-    },
-    FileRelayStream {
-        token: String,
-        start_addr: String,
+        chunk_size: u64,
         file_size: u64,
         parts: u32,
         index: u32,
-        name: String,
+        start_port: u16,
     },
     FileGetChunk {
         name: String,
     }, // "FILE GET-CHUNK <name>"
 
     // FILE (backup)
-    FileNotifyChunkSaved {
+    /// Saving node pushes its just-saved chunk to its predecessor.
+    /// PR6 replaced the older notify-then-pull dance (NOTIFY-CHUNK-SAVED →
+    /// GET-CHUNK-FOR-BACKUP) with this single push, halving the round trips
+    /// per saved chunk.
+    FileBackupPush {
         name: String,
-    }, // "FILE NOTIFY-CHUNK-SAVED <name>"
-    FileGetChunkForBackup {
-        name: String,
-    }, // "FILE GET-CHUNK-FOR-BACKUP <name>"
+        size: u64,
+    }, // "FILE BACKUP-PUSH <name> <size>"
     FileGetBackupChunk {
         name: String,
     }, // "FILE GET-BACKUP-CHUNK <name>"
@@ -341,22 +341,18 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
         return Ok(Command::FileGetChunk { name });
     }
 
-    // NOTIFY-CHUNK-SAVED
-    if let Some(rest) = rest.strip_prefix("NOTIFY-CHUNK-SAVED ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() {
-            return Err("missing file name for FILE NOTIFY-CHUNK-SAVED".into());
+    // BACKUP-PUSH (saving node → predecessor; raw bytes follow)
+    if let Some(rest) = rest.strip_prefix("BACKUP-PUSH ") {
+        let mut parts = rest.splitn(2, ' ');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let size_str = parts.next().unwrap_or("").trim();
+        if name.is_empty() {
+            return Err("missing file name for FILE BACKUP-PUSH".into());
         }
-        return Ok(Command::FileNotifyChunkSaved { name });
-    }
-
-    // GET-CHUNK-FOR-BACKUP
-    if let Some(rest) = rest.strip_prefix("GET-CHUNK-FOR-BACKUP ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() {
-            return Err("missing file name for FILE GET-CHUNK-FOR-BACKUP".into());
-        }
-        return Ok(Command::FileGetChunkForBackup { name });
+        let size = size_str
+            .parse::<u64>()
+            .map_err(|_| "invalid size for FILE BACKUP-PUSH")?;
+        return Ok(Command::FileBackupPush { name, size });
     }
 
     // GET-BACKUP-CHUNK
@@ -368,57 +364,251 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
         return Ok(Command::FileGetBackupChunk { name });
     }
 
-    // RELAY-BLOB
-    if let Some(rest) = rest.strip_prefix("RELAY-BLOB ") {
-        let mut parts = rest.splitn(4, ' ');
-        let token = parts.next().unwrap_or("").trim();
-        let start_addr = parts.next().unwrap_or("").trim();
-        let size_str = parts.next().unwrap_or("").trim();
-        let name = parts.next().unwrap_or("").to_string();
-        if token.is_empty() || start_addr.is_empty() || name.is_empty() {
-            return Err("malformed FILE RELAY-BLOB".into());
-        }
-        let size = size_str
-            .parse::<u64>()
-            .map_err(|_| "invalid size for FILE RELAY-BLOB")?;
-        return Ok(Command::FileRelayBlob {
-            token: token.to_string(),
-            start_addr: start_addr.to_string(),
-            size,
-            name,
-        });
-    }
-
-    // RELAY-STREAM
-    if let Some(rest) = rest.strip_prefix("RELAY-STREAM ") {
+    // PUSH-CHUNK (start node fans out to each chunk owner)
+    if let Some(rest) = rest.strip_prefix("PUSH-CHUNK ") {
         let mut parts = rest.splitn(6, ' ');
-        let token = parts.next().unwrap_or("").trim();
-        let start_addr = parts.next().unwrap_or("").trim();
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let chunk_size_str = parts.next().unwrap_or("").trim();
         let file_size_str = parts.next().unwrap_or("").trim();
         let total_parts_str = parts.next().unwrap_or("").trim();
         let index_str = parts.next().unwrap_or("").trim();
-        let name = parts.next().unwrap_or("").to_string();
-        if token.is_empty() || start_addr.is_empty() || name.is_empty() {
-            return Err("malformed FILE RELAY-STREAM".into());
+        let start_port_str = parts.next().unwrap_or("").trim();
+        if name.is_empty() {
+            return Err("missing name for FILE PUSH-CHUNK".into());
         }
+        let chunk_size = chunk_size_str
+            .parse::<u64>()
+            .map_err(|_| "invalid chunk_size for FILE PUSH-CHUNK")?;
         let file_size = file_size_str
             .parse::<u64>()
-            .map_err(|_| "invalid file_size for FILE RELAY-STREAM")?;
+            .map_err(|_| "invalid file_size for FILE PUSH-CHUNK")?;
         let parts_u = total_parts_str
             .parse::<u32>()
-            .map_err(|_| "invalid parts for FILE RELAY-STREAM")?;
+            .map_err(|_| "invalid parts for FILE PUSH-CHUNK")?;
         let index = index_str
             .parse::<u32>()
-            .map_err(|_| "invalid index for FILE RELAY-STREAM")?;
-        return Ok(Command::FileRelayStream {
-            token: token.to_string(),
-            start_addr: start_addr.to_string(),
+            .map_err(|_| "invalid index for FILE PUSH-CHUNK")?;
+        let start_port = start_port_str
+            .parse::<u16>()
+            .map_err(|_| "invalid start_port for FILE PUSH-CHUNK")?;
+        return Ok(Command::FilePushChunk {
+            name,
+            chunk_size,
             file_size,
             parts: parts_u,
             index,
-            name,
+            start_port,
         });
     }
 
     Err("unknown FILE command".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_next() {
+        assert_eq!(
+            parse_line("NODE NEXT 127.0.0.1:7001\n").unwrap(),
+            Command::NodeNext("127.0.0.1:7001".into())
+        );
+    }
+
+    #[test]
+    fn node_simple_verbs() {
+        assert_eq!(parse_line("NODE STATUS").unwrap(), Command::NodeStatus);
+        assert_eq!(parse_line("NODE PING").unwrap(), Command::NodePing);
+        assert_eq!(parse_line("NODE HEAL").unwrap(), Command::NodeHeal);
+    }
+
+    #[test]
+    fn node_heal_hop_and_done() {
+        assert_eq!(
+            parse_line("NODE HEAL-HOP tok 127.0.0.1:7000").unwrap(),
+            Command::NodeHealHop {
+                token: "tok".into(),
+                start_addr: "127.0.0.1:7000".into()
+            }
+        );
+        assert_eq!(
+            parse_line("NODE HEAL-DONE tok").unwrap(),
+            Command::NodeHealDone { token: "tok".into() }
+        );
+    }
+
+    #[test]
+    fn ring_forward() {
+        let cmd = parse_line("RING FORWARD 5 hello world").unwrap();
+        match cmd {
+            Command::RingForward { ttl, msg } => {
+                assert_eq!(ttl, 5);
+                assert_eq!(msg, "hello world");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_forward_bad_ttl() {
+        assert!(parse_line("RING FORWARD abc msg").is_err());
+    }
+
+    #[test]
+    fn topology_walk_hop_done_set() {
+        assert_eq!(parse_line("TOPOLOGY WALK").unwrap(), Command::TopologyWalk);
+        match parse_line("TOPOLOGY HOP tok 127.0.0.1:7000 a->b").unwrap() {
+            Command::TopologyHop {
+                token,
+                start_addr,
+                history,
+            } => {
+                assert_eq!(token, "tok");
+                assert_eq!(start_addr, "127.0.0.1:7000");
+                assert_eq!(history, "a->b");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_line("TOPOLOGY DONE tok a->b").unwrap() {
+            Command::TopologyDone { token, history } => {
+                assert_eq!(token, "tok");
+                assert_eq!(history, "a->b");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_line("TOPOLOGY SET a->b;b->c").unwrap() {
+            Command::TopologySet { history } => assert_eq!(history, "a->b;b->c"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn netmap_variants() {
+        assert_eq!(
+            parse_line("NETMAP DISCOVER").unwrap(),
+            Command::NetmapDiscover
+        );
+        assert_eq!(parse_line("NETMAP GET").unwrap(), Command::NetmapGet);
+        match parse_line("NETMAP HOP tok 127.0.0.1:7000 7000=Alive").unwrap() {
+            Command::NetmapHop {
+                token,
+                start_addr,
+                entries,
+            } => {
+                assert_eq!(token, "tok");
+                assert_eq!(start_addr, "127.0.0.1:7000");
+                assert_eq!(entries, "7000=Alive");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_line("NETMAP DONE tok 7000=Alive").unwrap() {
+            Command::NetmapDone { token, entries } => {
+                assert_eq!(token, "tok");
+                assert_eq!(entries, "7000=Alive");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_line("NETMAP SET 7000=Alive").unwrap() {
+            Command::NetmapSet { entries } => assert_eq!(entries, "7000=Alive"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_push_and_pull() {
+        match parse_line("FILE PUSH 1024 myfile").unwrap() {
+            Command::FilePush { size, name } => {
+                assert_eq!(size, 1024);
+                assert_eq!(name, "myfile");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_line("FILE PULL myfile").unwrap() {
+            Command::FilePull { name } => assert_eq!(name, "myfile"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_chunk_commands() {
+        match parse_line("FILE GET-CHUNK myfile.part-001-of-003").unwrap() {
+            Command::FileGetChunk { name } => assert_eq!(name, "myfile.part-001-of-003"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_line("FILE GET-BACKUP-CHUNK foo").unwrap() {
+            Command::FileGetBackupChunk { name } => assert_eq!(name, "foo"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_backup_push() {
+        match parse_line("FILE BACKUP-PUSH chunk.part-001-of-003 4096").unwrap() {
+            Command::FileBackupPush { name, size } => {
+                assert_eq!(name, "chunk.part-001-of-003");
+                assert_eq!(size, 4096);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Bad size
+        assert!(parse_line("FILE BACKUP-PUSH foo notanumber").is_err());
+        // Missing name
+        assert!(parse_line("FILE BACKUP-PUSH").is_err());
+    }
+
+    #[test]
+    fn file_push_chunk() {
+        // PR7 7-field shape: name chunk_size file_size parts index start_port
+        match parse_line("FILE PUSH-CHUNK myfile.part-002-of-005 4096 20480 5 1 7000")
+            .unwrap()
+        {
+            Command::FilePushChunk {
+                name,
+                chunk_size,
+                file_size,
+                parts,
+                index,
+                start_port,
+            } => {
+                assert_eq!(name, "myfile.part-002-of-005");
+                assert_eq!(chunk_size, 4096);
+                assert_eq!(file_size, 20480);
+                assert_eq!(parts, 5);
+                assert_eq!(index, 1);
+                assert_eq!(start_port, 7000);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_push_chunk_negative() {
+        // Bad numeric fields
+        assert!(parse_line("FILE PUSH-CHUNK n abc 1 1 0 7000").is_err());
+        // Missing fields
+        assert!(parse_line("FILE PUSH-CHUNK n 1").is_err());
+        // RELAY-STREAM is gone post-PR7; it must not parse.
+        assert!(parse_line("FILE RELAY-STREAM tok 7000 1024 3 0 0 myfile").is_err());
+    }
+
+    #[test]
+    fn negatives() {
+        assert!(parse_line("").is_err());
+        assert!(parse_line("BLAH").is_err());
+        assert!(parse_line("NODE NEXT").is_err()); // missing addr
+        assert!(parse_line("FILE PUSH abc xyz").is_err()); // non-numeric size
+        assert!(parse_line("FILE PUSH").is_err()); // no args
+        assert!(parse_line("FILE").is_err()); // missing verb
+    }
+
+    #[test]
+    fn crlf_tolerance() {
+        assert_eq!(parse_line("NODE STATUS\r\n").unwrap(), Command::NodeStatus);
+    }
+
+    #[test]
+    fn lowercase_noun_normalized() {
+        assert_eq!(parse_line("node status").unwrap(), Command::NodeStatus);
+    }
 }

@@ -2,9 +2,10 @@ use crate::NodeStatus;
 use serde::Serialize;
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -42,10 +43,6 @@ pub struct Node {
     // HEAL pending acks (start node only)
     pending_heals: RwLock<HashMap<String, oneshot::Sender<()>>>,
 
-    // FILE pending acks (start node only)
-    pending_files: RwLock<HashMap<String, oneshot::Sender<()>>>,
-    file_counter: AtomicU64,
-
     /// Status of all nodes on the network
     network_nodes: RwLock<HashMap<String, NodeStatus>>,
 
@@ -60,10 +57,29 @@ pub struct Node {
 
     /// Map of `port -> next_port` for the entire ring
     pub topology_map: RwLock<HashMap<String, String>>,
+
+    /// Filesystem root under which `<port>/content/` and `<port>/backup/` live.
+    /// Binary defaults to `PathBuf::from("nodes")`; tests pass a tempdir.
+    pub storage_root: PathBuf,
+
+    /// When false, dead-neighbor detection skips the respawn step.
+    /// Tests set this to false; the binary keeps it true.
+    pub respawn_dead: AtomicBool,
+
+    /// Counts how many times this node has called `broadcast_netmap_update`.
+    /// Useful for tests that want to assert "exactly one broadcast per dead
+    /// host"; also provides a cheap debug signal in production.
+    pub netmap_broadcasts: AtomicU64,
 }
 
 impl Node {
-    pub fn new(port: String, gossip_interval: Duration, file_size: u64) -> Arc<Self> {
+    pub fn new(
+        port: String,
+        gossip_interval: Duration,
+        file_size: u64,
+        storage_root: PathBuf,
+        respawn_dead: bool,
+    ) -> Arc<Self> {
         let network_nodes = RwLock::new(HashMap::new());
 
         Arc::new(Self {
@@ -72,13 +88,14 @@ impl Node {
             pending_walks: RwLock::new(HashMap::new()),
             walk_counter: AtomicU64::new(1),
             pending_heals: RwLock::new(HashMap::new()),
-            pending_files: RwLock::new(HashMap::new()),
-            file_counter: AtomicU64::new(1),
             network_nodes,
             file_tags: RwLock::new(HashMap::new()),
             gossip_interval,
             file_size,
             topology_map: RwLock::new(HashMap::new()),
+            storage_root,
+            respawn_dead: AtomicBool::new(respawn_dead),
+            netmap_broadcasts: AtomicU64::new(0),
         })
     }
 
@@ -228,55 +245,6 @@ impl Node {
         let mut s = TcpStream::connect(start_addr).await?;
         let line = format!("TOPOLOGY DONE {} {}\n", token, history);
         s.write_all(line.as_bytes()).await?;
-        Ok(())
-    }
-
-    // --- FILE helpers
-
-    fn next_file_token(&self) -> String {
-        let n = self.file_counter.fetch_add(1, Ordering::Relaxed);
-        format!("file-{}-{}", self.port, n)
-    }
-
-    pub fn make_file_token(&self) -> String {
-        self.next_file_token()
-    }
-
-    pub async fn register_file(&self, token: &str) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        self.pending_files
-            .write()
-            .await
-            .insert(token.to_string(), tx);
-        rx
-    }
-
-    pub async fn finish_file(&self, token: &str) -> bool {
-        if let Some(tx) = self.pending_files.write().await.remove(token) {
-            let _ = tx.send(());
-            true
-        } else {
-            false
-        }
-    }
-
-    pub async fn forward_file_relay_blob(
-        &self,
-        token: &str,
-        start_addr: &str,
-        size: u64,
-        name: &str,
-        data: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(next) = self.get_next().await {
-            let mut s = TcpStream::connect(&next).await?;
-            let header = format!(
-                "FILE RELAY-BLOB {} {} {} {}\n",
-                token, start_addr, size, name
-            );
-            s.write_all(header.as_bytes()).await?;
-            s.write_all(data).await?;
-        }
         Ok(())
     }
 }
@@ -448,6 +416,7 @@ impl Node {
 
     /// Gets current netmap entries and broadcasts them
     pub async fn broadcast_netmap_update(&self) {
+        self.netmap_broadcasts.fetch_add(1, Ordering::Relaxed);
         let entries = self.get_network_nodes_entries().await;
         self.broadcast_netmap(&entries).await;
     }
@@ -500,5 +469,50 @@ impl Node {
     /// Finds the next hop for a *specific node* from the stored topology
     pub async fn get_next_for_node(&self, port: &str) -> Option<String> {
         self.topology_map.read().await.get(port).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_edge, port_str};
+
+    #[test]
+    fn port_str_ipv4() {
+        assert_eq!(port_str("127.0.0.1:7000"), "7000");
+    }
+
+    #[test]
+    fn port_str_hostname() {
+        assert_eq!(port_str("localhost:8080"), "8080");
+    }
+
+    #[test]
+    fn port_str_no_colon() {
+        // Documents the fallback behavior: returns the input unchanged.
+        assert_eq!(port_str("7000"), "7000");
+    }
+
+    #[test]
+    fn port_str_ipv6_brackets() {
+        // rsplit handles IPv6-with-brackets correctly (port_str picks the
+        // last colon-separated chunk). Diverges from `host_of` in server.rs,
+        // which splits on the first colon.
+        assert_eq!(port_str("[::1]:7000"), "7000");
+    }
+
+    #[test]
+    fn append_edge_first() {
+        let h = append_edge(String::new(), "127.0.0.1:7000", "127.0.0.1:7001");
+        assert_eq!(h, "7000->7001");
+    }
+
+    #[test]
+    fn append_edge_subsequent() {
+        let h = append_edge(
+            "7000->7001".into(),
+            "127.0.0.1:7001",
+            "127.0.0.1:7002",
+        );
+        assert_eq!(h, "7000->7001;7001->7002");
     }
 }

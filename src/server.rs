@@ -6,7 +6,7 @@ use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing;
@@ -18,73 +18,88 @@ use crate::{
 
 type AnyErr = Box<dyn Error + Send + Sync>;
 
-/// Run the TCP server and handle connections.
-pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64) -> Result<(), AnyErr> {
-    // 1. Parse the address with an explicit type annotation
+/// Bind a node to `bind_addr`, create its on-disk storage tree, and return the
+/// pieces a caller needs to wire it (the `Arc<Node>` and the resolved
+/// `SocketAddr`) plus the `TcpListener` to feed to [`serve`].
+///
+/// Splitting the original `run()` lets the test harness:
+///   1. bind every node (collecting OS-assigned ports when bound to `:0`),
+///   2. wire the ring with `NODE NEXT` *before* any node starts accepting,
+///   3. spawn `serve()` per node and abort that handle to "kill" a node.
+pub async fn bind(
+    bind_addr: &str,
+    gossip_interval: Duration,
+    file_size: u64,
+    storage_root: PathBuf,
+    respawn_dead: bool,
+) -> Result<(Arc<Node>, TcpListener, std::net::SocketAddr), AnyErr> {
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
-    // 2. Create a socket based on IP version
     let socket = if addr.is_ipv6() {
         TcpSocket::new_v6()?
     } else {
         TcpSocket::new_v4()?
     };
 
-    // 3. Set the SO_REUSEADDR option
     socket.set_reuseaddr(true)?;
-
-    // 4. Set the SO_REUSEPORT option (required on macOS/BSD to bypass TIME_WAIT)
     #[cfg(unix)]
     socket.set_reuseport(true)?;
 
-    // 5. Bind the socket to the address
     socket.bind(addr)?;
-
-    // 6. Listen for incoming connections
     let listener = socket.listen(1024)?;
-
-    // 7. Get the local address
     let local = listener.local_addr()?;
 
-    // Initialize Node structure
-    let node = Node::new(local.to_string(), gossip_interval, file_size);
+    let node = Node::new(
+        local.to_string(),
+        gossip_interval,
+        file_size,
+        storage_root,
+        respawn_dead,
+    );
     tracing::info!(node = %node.port, "Node listening");
 
-    // Create nodes/<port>/content and nodes/<port>/backup directories
     let port_only = port_str(&node.port);
-    let content_dir = format!("nodes/{}/content", port_only);
-    let backup_dir = format!("nodes/{}/backup", port_only);
+    let content_dir = node.storage_root.join(port_only).join("content");
+    let backup_dir = node.storage_root.join(port_only).join("backup");
 
     if let Err(e) = fs::create_dir_all(&content_dir).await {
-        tracing::error!(node = %node.port, dir = %content_dir, error = ?e, "Failed to create node content directory");
+        tracing::error!(node = %node.port, dir = %content_dir.display(), error = ?e, "Failed to create node content directory");
         return Err(e.into());
     }
     if let Err(e) = fs::create_dir_all(&backup_dir).await {
-        tracing::error!(node = %node.port, dir = %backup_dir, error = ?e, "Failed to create node backup directory");
+        tracing::error!(node = %node.port, dir = %backup_dir.display(), error = ?e, "Failed to create node backup directory");
         return Err(e.into());
     }
 
-    tracing::info!(node = %node.port, content_dir = %content_dir, backup_dir = %backup_dir, "Created node directories");
+    tracing::info!(node = %node.port, content_dir = %content_dir.display(), backup_dir = %backup_dir.display(), "Created node directories");
 
-    // Spawn the gossip loop
-    if gossip_interval > Duration::from_millis(0) {
+    Ok((node, listener, local))
+}
+
+/// Drive a bound node: spawn the gossip loop and run the accept loop forever.
+/// Returns when the listener is dropped (e.g. the calling task is aborted).
+pub async fn serve(node: Arc<Node>, listener: TcpListener) {
+    if node.gossip_interval > Duration::from_millis(0) {
         let gossip_node = Arc::clone(&node);
         tokio::spawn(async move {
             tracing::info!(
                 node = %gossip_node.port,
-                interval = ?gossip_interval,
+                interval = ?gossip_node.gossip_interval,
                 "Gossip loop starting"
             );
             spawn_gossip_loop(gossip_node).await;
         });
     }
 
-    // Accept connections
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(node = %node.port, error = ?e, "Accept failed; serve loop exiting");
+                return;
+            }
+        };
         let node = Arc::clone(&node);
-
-        // Clone the port for logging before moving `node`
         let node_port = node.port.clone();
 
         tokio::spawn(async move {
@@ -93,6 +108,21 @@ pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64) -> 
             }
         });
     }
+}
+
+/// Run a single ring node: bind, then serve forever. Used by the binary;
+/// tests use [`bind`] + [`serve`] directly.
+pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64) -> Result<(), AnyErr> {
+    let (node, listener, _addr) = bind(
+        bind_addr,
+        gossip_interval,
+        file_size,
+        PathBuf::from("nodes"),
+        true,
+    )
+    .await?;
+    serve(node, listener).await;
+    Ok(())
 }
 
 async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr> {
@@ -184,41 +214,24 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 }
 
                 // FILE (internal)
-                protocol::Command::FileRelayBlob {
-                    token,
-                    start_addr,
-                    size,
+                protocol::Command::FilePushChunk {
                     name,
-                } => {
-                    handle_file_relay_blob(
-                        Arc::clone(&node),
-                        &mut reader,
-                        &mut writer,
-                        token,
-                        start_addr,
-                        size,
-                        name,
-                    )
-                    .await?
-                }
-                protocol::Command::FileRelayStream {
-                    token,
-                    start_addr,
+                    chunk_size,
                     file_size,
                     parts,
                     index,
-                    name,
+                    start_port,
                 } => {
-                    handle_file_relay_stream(
+                    handle_file_push_chunk(
                         Arc::clone(&node),
                         &mut reader,
                         &mut writer,
-                        token,
-                        start_addr,
+                        name,
+                        chunk_size,
                         file_size,
                         parts,
                         index,
-                        name,
+                        start_port,
                     )
                     .await?
                 }
@@ -227,11 +240,8 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 }
 
                 // FILE (backup)
-                protocol::Command::FileNotifyChunkSaved { name } => {
-                    handle_file_notify_chunk_saved(Arc::clone(&node), &mut writer, name).await?
-                }
-                protocol::Command::FileGetChunkForBackup { name } => {
-                    handle_file_get_chunk_for_backup(&node, &mut writer, name).await?
+                protocol::Command::FileBackupPush { name, size } => {
+                    handle_file_backup_push(&node, &mut reader, &mut writer, name, size).await?
                 }
                 protocol::Command::FileGetBackupChunk { name } => {
                     handle_file_get_backup_chunk(&node, &mut writer, name).await?
@@ -685,19 +695,25 @@ fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
     if (index as u64) < rem { base + 1 } else { base }
 }
 
-fn sum_len_up_to_inclusive(index: u32, total_size: u64, parts: u32) -> u64 {
-    (0..=index)
-        .map(|i| fair_chunk_len(i, total_size, parts))
-        .sum()
-}
-
 fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
     let safe = sanitize_filename(name);
     format!("{}.part-{:03}-of-{:03}", safe, index + 1, parts)
 }
 
-// --- FILE: PUSH / HOP handlers
+// --- FILE: PUSH (fan-out) handlers
 
+/// Start node for a `FILE PUSH`. Splits the upload across the ring by
+/// fanning out concurrent `FILE PUSH-CHUNK` connections — one per non-start
+/// chunk owner — instead of relaying through a serial chain.
+///
+/// The client byte-stream is inherently sequential (one TCP) so we read
+/// chunk i, save/forward, then read chunk i+1. The parallelism is in the
+/// per-target write-out + ACK-await: each target chunk has its own open
+/// TCP we write to in turn, and we await all `OK`s concurrently at the
+/// end. This means latency drops from O(N × hop) to O(longest hop) and
+/// failures are observed by the start node directly. PR7 also retired the
+/// dead `pending_files`/`finish_file` machinery on `Node`; ACK tracking
+/// now happens via the open outbound TCP connections instead.
 async fn handle_file_push<R, W>(
     node: Arc<Node>,
     reader: &mut R,
@@ -709,20 +725,17 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // Handle files larger than the node supports
+    // Reject oversized files; bounded drain so a malicious client can't OOM
+    // us by declaring `u64::MAX`.
     if size > node.file_size {
         tracing::error!(node = %node.port, file_name = %name, file_size = size, max_file_size = %node.file_size, "File size is too large");
-
         let msg = format!(
             "ERR File size is too large ({} > {})\n",
             size, node.file_size
         );
         writer.write_all(msg.as_bytes()).await?;
-
-        // Drain the stream to consume the file body the client is sending
-        let mut sink = vec![0u8; size as usize];
-        reader.read_exact(&mut sink).await?;
-
+        let mut limited = (&mut *reader).take(size);
+        tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
         return Ok(());
     }
 
@@ -733,24 +746,29 @@ where
         .unwrap()
         .to_string();
 
-    // Determine how many parts to split into: number of known nodes (fallback to 1)
     let parts: u32 = node.network_size().await as u32;
-
-    // Update local file_tags (start, size, parts)
     let start_port_num: u16 = port_str(&node.port).parse().unwrap_or(0);
     node.set_file_tag(&name, start_port_num, size, parts).await;
 
+    // Single-node ring: save chunk 0 locally and we're done. No fan-out
+    // needed; this also handles the parts==1 short-circuit the test
+    // `fanout_push_parts_eq_one` pins.
     if parts == 1 {
-        // Single node: read everything and store locally
-        let mut buf = vec![0u8; size as usize];
-        reader.read_exact(&mut buf).await?;
-        let _ = save_into_node_dir(&node, &name, &buf, "content").await?;
+        let chunk_name = chunk_file_name(&name, 0, parts);
+        let path = node
+            .storage_root
+            .join(port_str(&node.port))
+            .join("content")
+            .join(sanitize_filename(&chunk_name));
+        let mut f = tokio::fs::File::create(&path).await?;
+        let mut limited = (&mut *reader).take(size);
+        copy(&mut limited, &mut f).await?;
+        f.flush().await?;
 
-        // Notify predecessor
         let node_clone = Arc::clone(&node);
-        let name_clone = name.clone();
+        let cn = chunk_name.clone();
         tokio::spawn(async move {
-            notify_predecessor(node_clone, name_clone).await;
+            push_to_predecessor(node_clone, cn).await;
         });
 
         writer
@@ -759,50 +777,129 @@ where
         return Ok(());
     }
 
-    // We need a next hop
-    let Some(next) = node.get_next().await else {
-        writer.write_all(b"ERR no next hop set\n").await?;
-        // Drain the stream to keep protocol in sync
-        let mut sink = vec![0u8; size as usize];
-        reader.read_exact(&mut sink).await?;
-        return Ok(());
+    // Walk the topology snapshot to find chunk i's owner address. Chunk 0
+    // is us; chunks 1..parts-1 each go to the next hop in turn. The
+    // topology map stores `port -> next_port` already keyed on bare ports.
+    let topology: std::collections::HashMap<String, String> =
+        node.topology_map.read().await.clone();
+    let host = host_of(&node.port).to_string();
+    let mut target_addrs: Vec<String> = Vec::with_capacity(parts as usize - 1);
+    {
+        let mut current = port_str(&node.port).to_string();
+        for _ in 1..parts {
+            let Some(next) = topology.get(&current).cloned() else {
+                writer.write_all(b"ERR topology incomplete; cannot fan out\n").await?;
+                let mut limited = (&mut *reader).take(size);
+                tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+                return Ok(());
+            };
+            target_addrs.push(format!("{}:{}", host, next));
+            current = next;
+        }
+    }
+
+    // Open all outbound connections in parallel (one per non-start chunk).
+    // If any connect fails we abort the whole push: the client gets ERR
+    // and drains. Future work could fall back to a relay; not in scope.
+    let connect_futures = target_addrs.iter().map(|addr| {
+        let addr = addr.clone();
+        async move { TcpStream::connect(&addr).await.map(|s| (addr, s)) }
+    });
+    let mut conns: Vec<(String, TcpStream)> = match futures::future::try_join_all(connect_futures).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(node = %node.port, error = ?e, "Fan-out connect failed");
+            writer.write_all(b"ERR fan-out connect failed\n").await?;
+            let mut limited = (&mut *reader).take(size);
+            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+            return Ok(());
+        }
     };
 
-    let first_len = fair_chunk_len(0, size, parts);
-    // Read and save this node's first chunk
-    let mut first = vec![0u8; first_len as usize];
-    reader.read_exact(&mut first).await?;
-    let chunk_name = chunk_file_name(&name, 0, parts);
-    let saved_as = save_into_node_dir(&node, &chunk_name, &first, "content").await?;
+    // Send a PUSH-CHUNK header per outbound connection up front so the
+    // receivers know how many bytes to expect. Chunk lengths come from
+    // fair_chunk_len; index i+1 lives on conns[i].
+    for (i, (_addr, s)) in conns.iter_mut().enumerate() {
+        let index = (i + 1) as u32;
+        let chunk_size = fair_chunk_len(index, size, parts);
+        let chunk_name = chunk_file_name(&name, index, parts);
+        let header = format!(
+            "FILE PUSH-CHUNK {} {} {} {} {} {}\n",
+            chunk_name, chunk_size, size, parts, index, start_port_num
+        );
+        if let Err(e) = s.write_all(header.as_bytes()).await {
+            tracing::error!(node = %node.port, error = ?e, "Failed to send PUSH-CHUNK header");
+            writer.write_all(b"ERR fan-out header write failed\n").await?;
+            let mut limited = (&mut *reader).take(size);
+            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+            return Ok(());
+        }
+    }
 
-    // Notify predecessor
+    // Stream the client byte stream chunk by chunk. Chunk 0 lands on disk
+    // here; chunks 1..parts-1 stream straight to the corresponding
+    // outbound conn (zero buffering on the start node).
+    let chunk0_name = chunk_file_name(&name, 0, parts);
+    let chunk0_path = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("content")
+        .join(sanitize_filename(&chunk0_name));
+    let mut chunk0 = tokio::fs::File::create(&chunk0_path).await?;
+    let len0 = fair_chunk_len(0, size, parts);
+    {
+        let mut limited = (&mut *reader).take(len0);
+        copy(&mut limited, &mut chunk0).await?;
+    }
+    chunk0.flush().await?;
+
+    // Backup chunk 0 to predecessor.
     let node_clone = Arc::clone(&node);
-    let chunk_name_clone = chunk_name.clone();
+    let cn0 = chunk0_name.clone();
     tokio::spawn(async move {
-        notify_predecessor(node_clone, chunk_name_clone).await;
+        push_to_predecessor(node_clone, cn0).await;
     });
 
-    tracing::info!(
-        node = %node.port,
-        chunk = 1,
-        parts,
-        file = %saved_as.display(),
-        bytes = first_len,
-        "Saved file chunk"
-    );
+    for (i, (_addr, s)) in conns.iter_mut().enumerate() {
+        let index = (i + 1) as u32;
+        let chunk_size = fair_chunk_len(index, size, parts);
+        if chunk_size == 0 {
+            continue;
+        }
+        let mut limited = (&mut *reader).take(chunk_size);
+        if let Err(e) = copy(&mut limited, s).await {
+            tracing::error!(node = %node.port, error = ?e, "Failed streaming chunk to fan-out target");
+            writer.write_all(b"ERR fan-out stream failed\n").await?;
+            return Ok(());
+        }
+    }
 
-    // Open connection to next and stream the remaining bytes
-    let mut s = TcpStream::connect(&next).await?;
-    let token = node.make_file_token();
-    let header = format!(
-        "FILE RELAY-STREAM {} {} {} {} {} {}\n",
-        token, &node.port, size, parts, 1, name
-    );
-    s.write_all(header.as_bytes()).await?;
-
-    // Forward exactly the remaining bytes (size - first_len) from client -> next
-    let mut limited = reader.take(size - first_len);
-    copy(&mut limited, &mut s).await?;
+    // Now wait for OK from every backend, with a per-push deadline.
+    use tokio::io::AsyncBufReadExt;
+    let ack_timeout = std::time::Duration::from_secs(30);
+    for (addr, s) in conns.iter_mut() {
+        let mut br = tokio::io::BufReader::new(s);
+        let mut line = String::new();
+        match tokio::time::timeout(ack_timeout, br.read_line(&mut line)).await {
+            Ok(Ok(0)) | Err(_) => {
+                tracing::error!(node = %node.port, target = %addr, "PUSH-CHUNK ACK timed out or EOF");
+                writer.write_all(b"ERR fan-out ack timeout\n").await?;
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                tracing::error!(node = %node.port, target = %addr, error = ?e, "PUSH-CHUNK ACK io error");
+                writer.write_all(b"ERR fan-out ack io\n").await?;
+                return Ok(());
+            }
+            Ok(Ok(_)) => {
+                if !line.trim_start().starts_with("OK") {
+                    tracing::error!(node = %node.port, target = %addr, response = %line.trim(), "PUSH-CHUNK target returned non-OK");
+                    writer.write_all(b"ERR fan-out non-ok\n").await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
 
     writer
         .write_all(
@@ -816,130 +913,68 @@ where
     Ok(())
 }
 
-async fn handle_file_relay_blob<R, W>(
+/// Receiver side of fan-out PUSH. Streams `chunk_size` bytes from the
+/// connection straight to disk, tags the file, kicks off backup-push,
+/// replies `OK\n`. Replaces the older RELAY-STREAM hop handler.
+async fn handle_file_push_chunk<R, W>(
     node: Arc<Node>,
     reader: &mut R,
     writer: &mut W,
-    token: String,
-    start_addr: String,
-    size: u64,
     name: String,
-) -> Result<(), AnyErr>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    // Read the exact file body first
-    let mut buf = vec![0u8; size as usize];
-    reader.read_exact(&mut buf).await?;
-
-    // If this hop delivered back to the start node, just finish & ACK.
-    if port_str(&node.port) == port_str(&start_addr) {
-        let _ = node.finish_file(&token).await;
-        let _ = writer.write_all(b"OK\n").await;
-        return Ok(());
-    }
-
-    // Save locally
-    if let Err(e) = save_into_node_dir(&node, &name, &buf, "content").await {
-        tracing::error!(node = %node.port, file_name = %name, error = ?e, "Failed to save relayed file blob");
-    } else {
-        // Notify predecessor
-        let node_clone = Arc::clone(&node);
-        let name_clone = name.clone();
-        tokio::spawn(async move {
-            notify_predecessor(node_clone, name_clone).await;
-        });
-    }
-
-    // Forward to next
-    if let Some(_) = node.get_next().await {
-        if let Err(e) = node
-            .forward_file_relay_blob(&token, &start_addr, size, &name, &buf)
-            .await
-        {
-            tracing::warn!(node = %node.port, error = ?e, "FILE RELAY-BLOB forward failed");
-        }
-    }
-
-    let _ = writer.write_all(b"OK\n").await;
-    Ok(())
-}
-
-async fn handle_file_relay_stream<R, W>(
-    node: Arc<Node>,
-    reader: &mut R,
-    writer: &mut W,
-    token: String,
-    start_addr: String,
+    chunk_size: u64,
     file_size: u64,
     parts: u32,
     index: u32,
-    name: String,
+    start_port: u16,
 ) -> Result<(), AnyErr>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     if index >= parts {
-        writer
-            .write_all(b"ERR bad FILE RELAY-STREAM index\n")
-            .await?;
+        writer.write_all(b"ERR bad FILE PUSH-CHUNK index\n").await?;
         return Ok(());
     }
 
-    // Compute the chunk length and read exactly those bytes
-    let my_len = fair_chunk_len(index, file_size, parts);
-    let mut buf = vec![0u8; my_len as usize];
-    reader.read_exact(&mut buf).await?;
-
-    // Tag the file on this node too
-    let start_port_num: u16 = port_str(&start_addr).parse().unwrap_or(0);
-    node.set_file_tag(&name, start_port_num, file_size, parts)
+    // The chunk name embeds index/parts; reconstruct the parent file name
+    // from the chunk name so the file_tags entry uses the right key.
+    // Convention: chunk_file_name(name, index, parts) =
+    // "<name>.part-XXX-of-YYY". The receiver's `name` argument is already
+    // the full chunk name; recover the parent.
+    let parent_name = name
+        .rsplit_once(".part-")
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_else(|| name.clone());
+    node.set_file_tag(&parent_name, start_port, file_size, parts)
         .await;
 
-    // Save my chunk locally
-    let chunk_name = chunk_file_name(&name, index, parts);
-    let saved_as = save_into_node_dir(&node, &chunk_name, &buf, "content").await?;
-
-    // Notify predecessor
-    let node_clone = Arc::clone(&node);
-    tokio::spawn(async move {
-        notify_predecessor(node_clone, chunk_name).await;
-    });
+    let path = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("content")
+        .join(sanitize_filename(&name));
+    let mut file = tokio::fs::File::create(&path).await?;
+    if chunk_size > 0 {
+        let mut limited = reader.take(chunk_size);
+        copy(&mut limited, &mut file).await?;
+    }
+    file.flush().await?;
 
     tracing::info!(
         node = %node.port,
         chunk = index + 1,
         parts,
-        file = %saved_as.display(),
-        bytes = my_len,
-        "Saved file chunk"
+        file = %path.display(),
+        bytes = chunk_size,
+        "Stored fan-out chunk"
     );
 
-    // If not the last chunk, forward remaining bytes to next with index+1
-    let consumed = sum_len_up_to_inclusive(index, file_size, parts);
-    let remaining = file_size - consumed;
-    if remaining > 0 {
-        if let Some(next) = node.get_next().await {
-            let mut s = TcpStream::connect(&next).await?;
-            let header = format!(
-                "FILE RELAY-STREAM {} {} {} {} {} {}\n",
-                token,
-                start_addr,
-                file_size,
-                parts,
-                index + 1,
-                name
-            );
-            s.write_all(header.as_bytes()).await?;
-            let mut limited = reader.take(remaining);
-            copy(&mut limited, &mut s).await?;
-        }
-    } else {
-        // nothing left to do
-        let _ = node.finish_file(&token).await;
-    }
+    // Backup push to predecessor (PR6).
+    let node_clone = Arc::clone(&node);
+    let cn = name.clone();
+    tokio::spawn(async move {
+        push_to_predecessor(node_clone, cn).await;
+    });
 
     writer.write_all(b"OK\n").await?;
     Ok(())
@@ -973,12 +1008,8 @@ async fn handle_file_pull<W: AsyncWrite + Unpin>(
     let start_addr = format!("{}:{}", host_of(&node.port), start_port);
     drop(tags);
 
-    // Assemble full file by walking the ring starting at start_addr
-    let bytes = pull_file_from_ring(node, &name, &start_addr, parts, file_size).await?;
-
-    // IMPORTANT: return *pure bytes*, no textual header or trailer.
-    writer.write_all(&bytes).await?;
-    Ok(())
+    // Stream each chunk straight to the client (no full-file Vec).
+    pull_file_from_ring(node, &name, &start_addr, parts, file_size, writer).await
 }
 
 async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
@@ -988,20 +1019,33 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
 ) -> Result<(), AnyErr> {
     let next = node.get_next().await.unwrap_or_else(|| node.port.clone());
 
-    // Read the specific chunk from the "content" directory
-    let chunk_path = PathBuf::from(format!(
-        "nodes/{}/content/{}",
-        port_str(&node.port),
-        sanitize_filename(&name)
-    ));
+    let chunk_path = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("content")
+        .join(sanitize_filename(&name));
 
-    let chunk = fs::read(&chunk_path).await.unwrap_or_default();
-
-    // Header + exact bytes for node-to-node transfer
+    // Stream the chunk straight from disk to the wire (no full-chunk Vec).
+    // Open first so the metadata().len() we announce matches the bytes we
+    // ship, even if a concurrent process were to truncate the file —
+    // chunks here are immutable in practice, but this is the natural
+    // pattern.
+    let mut f = match tokio::fs::File::open(&chunk_path).await {
+        Ok(f) => f,
+        Err(_) => {
+            writer
+                .write_all(format!("FILE RESP-CHUNK {} 0 {}\n", next, name).as_bytes())
+                .await?;
+            return Ok(());
+        }
+    };
+    let len = f.metadata().await?.len();
     writer
-        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, chunk.len(), name).as_bytes())
+        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, len, name).as_bytes())
         .await?;
-    writer.write_all(&chunk).await?;
+    if len > 0 {
+        copy(&mut f, writer).await?;
+    }
     Ok(())
 }
 
@@ -1010,117 +1054,50 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
 /// Handles "FILE NOTIFY-CHUNK-SAVED <name>"
 /// This node is the predecessor (i). It is being notified by its successor (i+1).
 /// It must now fetch the chunk from (i+1) and save it to its /backup dir.
-async fn handle_file_notify_chunk_saved<W: AsyncWrite + Unpin>(
-    node: Arc<Node>,
+/// Handles "FILE BACKUP-PUSH <name> <size>" + raw bytes.
+///
+/// PR6: replaces the older notify-then-pull dance. The saving node opens
+/// one connection to its predecessor, ships the chunk in a single round
+/// trip, gets `OK`. Bytes stream straight from the wire to disk — no
+/// `Vec<u8>` of size = chunk_size.
+async fn handle_file_backup_push<R, W>(
+    node: &Node,
+    reader: &mut R,
     writer: &mut W,
-    chunk_name: String,
-) -> Result<(), AnyErr> {
-    // Find the successor (i+1) from whom it received the notification
-    let Some(next_addr) = node.get_next().await else {
-        tracing::warn!(node = %node.port, chunk = %chunk_name, "Got NOTIFY-CHUNK-SAVED but have no next_port to fetch from.");
-        writer.write_all(b"OK (but no next_port)\n").await?;
-        return Ok(());
-    };
+    name: String,
+    size: u64,
+) -> Result<(), AnyErr>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let fname = sanitize_filename(&name);
+    let dest_path = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("backup")
+        .join(&fname);
+
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).await.ok();
+    }
+
+    let mut f = tokio::fs::File::create(&dest_path).await?;
+    if size > 0 {
+        let mut limited = reader.take(size);
+        copy(&mut limited, &mut f).await?;
+    }
+    f.flush().await?;
 
     tracing::info!(
         node = %node.port,
-        target = %next_addr,
-        chunk = %chunk_name,
-        "Backup process: Requesting chunk from successor."
+        chunk = %name,
+        bytes = size,
+        path = %dest_path.display(),
+        "Backup chunk received and stored (push)."
     );
 
-    // Spawn a new task to do the backup and ACK the notification immediately
-    tokio::spawn(async move {
-        match request_chunk_for_backup(&next_addr, &chunk_name).await {
-            Ok(chunk_data) => {
-                if chunk_data.is_empty() {
-                    tracing::warn!(
-                        node = %node.port,
-                        from = %next_addr,
-                        chunk = %chunk_name,
-                        "Backup fetch: Got 0 bytes."
-                    );
-                    return;
-                }
-
-                // Save to "/backup" directory
-                match save_into_node_dir(&node, &chunk_name, &chunk_data, "backup").await {
-                    Ok(path) => {
-                        tracing::info!(
-                            node = %node.port,
-                            from = %next_addr,
-                            chunk = %chunk_name,
-                            path = %path.display(),
-                            bytes = chunk_data.len(),
-                            "Backup chunk saved successfully."
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            node = %node.port,
-                            chunk = %chunk_name,
-                            error = ?e,
-                            "Failed to save backup chunk."
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    node = %node.port,
-                    target = %next_addr,
-                    chunk = %chunk_name,
-                    error = ?e,
-                    "Failed to request chunk for backup."
-                );
-            }
-        }
-    });
-
-    // ACK the notification immediately
     writer.write_all(b"OK\n").await?;
-    Ok(())
-}
-
-/// Handles "FILE GET-CHUNK-FOR-BACKUP <name>"
-/// This is used by the backup process. It reads from the "/content" dir
-/// and returns <8-byte-size><raw-bytes>.
-async fn handle_file_get_chunk_for_backup<W: AsyncWrite + Unpin>(
-    node: &Node,
-    writer: &mut W,
-    name: String, // This is the full chunk name
-) -> Result<(), AnyErr> {
-    // Sanitize the name, although it should already be safe
-    let fname = sanitize_filename(&name);
-    let path = PathBuf::from(format!(
-        "nodes/{}/content/{}", // Read from "/content"
-        port_str(&node.port),
-        fname
-    ));
-
-    let (chunk, size) = match fs::read(&path).await {
-        Ok(data) => {
-            let size = data.len() as u64;
-            (data, size)
-        }
-        Err(e) => {
-            tracing::warn!(
-                node = %node.port,
-                path = %path.display(),
-                error = ?e,
-                "GET-CHUNK-FOR-BACKUP: File not found or unreadable."
-            );
-            (Vec::new(), 0u64) // Send 0 bytes on error
-        }
-    };
-
-    // 1. Send the 8-byte size (u64, big-endian)
-    writer.write_all(&size.to_be_bytes()).await?;
-
-    // 2. Send the raw file bytes
-    if size > 0 {
-        writer.write_all(&chunk).await?;
-    }
     Ok(())
 }
 
@@ -1134,106 +1111,153 @@ async fn handle_file_get_backup_chunk<W: AsyncWrite + Unpin>(
 ) -> Result<(), AnyErr> {
     let next = node.get_next().await.unwrap_or_else(|| node.port.clone());
 
-    // Read from "backup" directory
-    let chunk_path = PathBuf::from(format!(
-        "nodes/{}/backup/{}",
-        port_str(&node.port),
-        sanitize_filename(&name)
-    ));
+    let chunk_path = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("backup")
+        .join(sanitize_filename(&name));
 
-    let chunk = fs::read(&chunk_path).await.unwrap_or_default();
-
-    // Respond with the same protocol message as GET-CHUNK
+    // Same streaming pattern as GET-CHUNK, against the /backup dir.
+    let mut f = match tokio::fs::File::open(&chunk_path).await {
+        Ok(f) => f,
+        Err(_) => {
+            writer
+                .write_all(format!("FILE RESP-CHUNK {} 0 {}\n", next, name).as_bytes())
+                .await?;
+            return Ok(());
+        }
+    };
+    let len = f.metadata().await?.len();
     writer
-        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, chunk.len(), name).as_bytes())
+        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, len, name).as_bytes())
         .await?;
-    writer.write_all(&chunk).await?;
+    if len > 0 {
+        copy(&mut f, writer).await?;
+    }
     Ok(())
 }
 
 // --- PULL helpers
 
-async fn pull_file_from_ring(
+async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
     node: &Node,
     name: &str,
     start_addr: &str,
     parts: u32,
     _file_size: u64,
-) -> Result<Vec<u8>, AnyErr> {
-    let mut out = Vec::new();
-    let mut current_addr = start_addr.to_string();
-    let mut current_port = port_str(start_addr).to_string();
-    let host = host_of(start_addr);
-    let topology = node.topology_map.read().await;
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    use futures::stream::{FuturesOrdered, StreamExt};
+    use std::collections::{HashMap, HashSet};
+    use tokio::sync::Semaphore;
 
-    for i in 0..parts {
-        let chunk_name = chunk_file_name(name, i, parts);
-        let chunk: Vec<u8>;
+    let host = host_of(start_addr).to_string();
 
-        // 1. Try to get chunk from the current node
-        match request_chunk_from(&current_addr, &chunk_name).await {
+    // Snapshot the topology once. Holding the read guard across the per-chunk
+    // network I/O blocked any heal/discover broadcast that wanted to write
+    // (deadlocking concurrent NETMAP DISCOVER while a long pull was in
+    // flight). The snapshot can become stale if a node dies mid-pull, but
+    // that already fell through to the backup path; same outcome, fewer
+    // contention surprises.
+    let topology: HashMap<String, String> = node.topology_map.read().await.clone();
+
+    // Reverse map: dead_port -> predecessor_port. O(1) lookup replaces the
+    // O(N) scan that ran per failed chunk.
+    let predecessor_of: HashMap<String, String> = topology
+        .iter()
+        .map(|(from, to)| (port_str(to).to_string(), from.clone()))
+        .collect();
+
+    // 1. Build a fetch plan by walking the topology snapshot once.
+    //    Chunk i lives on the node at hop i from the start.
+    let mut plan: Vec<(u32, String, String, String)> = Vec::with_capacity(parts as usize);
+    {
+        let mut current_addr = start_addr.to_string();
+        let mut current_port = port_str(start_addr).to_string();
+        for i in 0..parts {
+            plan.push((
+                i,
+                chunk_file_name(name, i, parts),
+                current_addr.clone(),
+                current_port.clone(),
+            ));
+            // Advance to the next node, even on the last iteration we don't
+            // use it. If the topology is broken mid-walk we stop early —
+            // missing entries become "no chunks" (short output, see PR3
+            // regression pin).
+            let Some(next) = topology.get(&current_port).cloned() else {
+                tracing::error!(
+                    node = %node.port,
+                    from_node = %current_port,
+                    "Topology snapshot incomplete; pull plan truncated."
+                );
+                break;
+            };
+            current_port = next.clone();
+            current_addr = format!("{}:{}", host, next);
+        }
+    }
+
+    // 2. Spawn fetches concurrently with a small in-flight cap. Throttling
+    //    keeps queued-but-not-yet-written chunks bounded if the client
+    //    reads slowly: at most CAP * largest_chunk bytes in RAM.
+    const FETCH_CONCURRENCY: usize = 4;
+    let sem = Arc::new(Semaphore::new(FETCH_CONCURRENCY));
+
+    let mut tasks: FuturesOrdered<_> = plan
+        .into_iter()
+        .map(|(i, chunk_name, owner_addr, owner_port)| {
+            let sem = Arc::clone(&sem);
+            async move {
+                // Acquire-on-spawn would defeat ordered pipelining; acquire
+                // inside the task so FuturesOrdered can buffer up to CAP
+                // pending tasks while the writer drains in order.
+                let _permit = sem.acquire_owned().await.expect("semaphore closed");
+                let r = request_chunk_from(&owner_addr, &chunk_name).await;
+                (i, chunk_name, owner_addr, owner_port, r)
+            }
+        })
+        .collect();
+
+    // 3. Drain in chunk-index order, streaming each result to the client.
+    //    Failed chunks are recovered synchronously from the predecessor's
+    //    backup; failed ports are batched and broadcast once at the end so
+    //    we don't emit N "Broadcasting node status" lines for one dead host.
+    let mut failed_ports: HashSet<String> = HashSet::new();
+
+    while let Some((_i, chunk_name, owner_addr, owner_port, r)) = tasks.next().await {
+        let chunk: Vec<u8> = match r {
             Ok((chunk_data, _next_addr_ignored)) => {
-                // Node is alive.
                 tracing::debug!(
                     node = %node.port,
-                    from = %current_addr,
+                    from = %owner_addr,
                     chunk_name = %chunk_name,
                     "Got chunk successfully."
                 );
-                chunk = chunk_data;
+                chunk_data
             }
             Err(e) => {
-                // 1.2. Node is likely dead
                 tracing::warn!(
                     node = %node.port,
-                    target_node = %current_addr,
+                    target_node = %owner_addr,
                     chunk_name = %chunk_name,
                     error = ?e,
                     "Failed to get chunk from node. Attempting to use backup."
                 );
+                failed_ports.insert(owner_port.clone());
 
-                // Mark node as Dead and broadcast this change
-                tracing::info!(
-                    node = %node.port,
-                    dead_node = %current_port,
-                    "Marking node as Dead and broadcasting netmap update."
-                );
-                node.update_node_status(current_port.clone(), crate::NodeStatus::Dead)
-                    .await;
-
-                // Await the broadcast to ensure state is sent before we continue
-                node.broadcast_netmap_update().await;
-
-                // 1.3. Find the predecessor of the dead node (the one holding the backup)
-                let pred_port = topology
-                    .iter()
-                    .find(|(_from, to)| port_str(to) == current_port)
-                    .map(|(from, _to)| from.clone());
-
-                let Some(pred_port) = pred_port else {
+                // Find predecessor (backup holder) and try the backup path.
+                let Some(pred_port) = predecessor_of.get(&owner_port).cloned() else {
                     tracing::error!(
                         node = %node.port,
-                        dead_node = %current_addr,
-                        "No predecessor found in topology for dead node. Cannot fetch backup."
+                        dead_node = %owner_addr,
+                        chunk_name = %chunk_name,
+                        "No predecessor found in topology for dead node. \
+                         Output will be SHORT (chunk omitted, no zero-padding)."
                     );
-                    chunk = Vec::new();
-                    out.extend_from_slice(&chunk);
-
-                    // Manually advance to the next node to avoid getting stuck
-                    let next_port = topology.get(&current_port).cloned();
-                    if let Some(port) = next_port {
-                        current_port = port.clone();
-                        current_addr = format!("{}:{}", host, port);
-                    } else {
-                        tracing::error!(node=%node.port, dead_node=%current_port, "Topology broken. Cannot find next hop.");
-                        break;
-                    }
                     continue;
                 };
-
                 let pred_addr = format!("{}:{}", host, pred_port);
-
-                // 1.4. Request the backup chunk from the predecessor
                 match request_backup_chunk_from(&pred_addr, &chunk_name).await {
                     Ok((chunk_data, _)) => {
                         tracing::info!(
@@ -1242,7 +1266,7 @@ async fn pull_file_from_ring(
                             chunk_name = %chunk_name,
                             "Successfully retrieved chunk from backup."
                         );
-                        chunk = chunk_data;
+                        chunk_data
                     }
                     Err(e_backup) => {
                         tracing::error!(
@@ -1250,34 +1274,39 @@ async fn pull_file_from_ring(
                             backup_node = %pred_addr,
                             chunk_name = %chunk_name,
                             error = ?e_backup,
-                            "Failed to get chunk from backup node. File will be corrupt."
+                            "Failed to get chunk from backup node. \
+                             Output will be SHORT (chunk omitted, no zero-padding)."
                         );
-                        chunk = Vec::new();
+                        Vec::new()
                     }
                 }
             }
-        }
+        };
 
-        out.extend_from_slice(&chunk);
-
-        // 2. Find the next node in the chain to query
-        let next_port = topology.get(&current_port).cloned();
-
-        if let Some(port) = next_port {
-            current_port = port.clone();
-            current_addr = format!("{}:{}", host, port);
-        } else {
-            // This should only happen if the topology is broken
-            tracing::error!(
-                node = %node.port,
-                from_node = %current_port,
-                "Topology map is broken. Cannot find next hop. Stopping pull."
-            );
-            break;
+        if !chunk.is_empty() {
+            writer.write_all(&chunk).await?;
         }
     }
 
-    Ok(out)
+    // 4. Single batch netmap update + broadcast for the dead set, deferred
+    //    until after the pull completes so we emit at most one
+    //    "Broadcasting node status" line per dead host (not per failed
+    //    chunk). This is the regression that `failover_no_double_broadcast`
+    //    pins.
+    if !failed_ports.is_empty() {
+        for port in &failed_ports {
+            tracing::info!(
+                node = %node.port,
+                dead_node = %port,
+                "Marking node as Dead and broadcasting netmap update."
+            );
+            node.update_node_status(port.clone(), crate::NodeStatus::Dead)
+                .await;
+        }
+        node.broadcast_netmap_update().await;
+    }
+
+    Ok(())
 }
 
 async fn request_chunk_from(addr: &str, chunk_name: &str) -> Result<(Vec<u8>, String), AnyErr> {
@@ -1402,23 +1431,6 @@ fn sanitize_filename(name: &str) -> String {
     if out.is_empty() { "_".into() } else { out }
 }
 
-async fn save_into_node_dir(
-    node: &Node,
-    name: &str,
-    data: &[u8],
-    subdir: &str,
-) -> Result<PathBuf, AnyErr> {
-    let fname = sanitize_filename(name);
-    let path = PathBuf::from(format!(
-        "nodes/{}/{}/{}",
-        port_str(&node.port),
-        subdir,
-        fname
-    ));
-    fs::write(&path, data).await?;
-    Ok(path)
-}
-
 /// Minimal CSV escaping for names containing commas, quotes, or newlines.
 fn csv_escape(s: &str) -> String {
     let needs_quotes = s.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r'));
@@ -1465,59 +1477,72 @@ async fn get_predecessor_addr(node: &Node) -> Option<String> {
 }
 
 /// Helper to send the notification
-async fn notify_predecessor(node: Arc<Node>, chunk_name: String) {
-    if let Some(pred_addr) = get_predecessor_addr(&node).await {
-        tracing::info!(
-            node = %node.port,
-            predecessor = %pred_addr,
-            chunk = %chunk_name,
-            "Notifying predecessor of new chunk."
-        );
+/// Push a just-saved chunk to this node's predecessor for backup.
+///
+/// PR6: replaces the older `notify_predecessor` + `fetch_chunk_for_backup_to`
+/// dance. Two TCP setups + two round trips became one. Bytes stream straight
+/// from `/content` on the saving node to `/backup` on the predecessor — no
+/// `Vec<u8>` of size = chunk_size on either side.
+///
+/// Fire-and-forget: every error path is logged and swallowed. Predecessor
+/// unreachable is the documented degraded-mode behavior; the local save
+/// already committed so the chunk is available via PULL even without a
+/// backup until the next push for the same chunk happens.
+async fn push_to_predecessor(node: Arc<Node>, chunk_name: String) {
+    let Some(pred_addr) = get_predecessor_addr(&node).await else {
+        tracing::warn!(node = %node.port, chunk = %chunk_name, "No predecessor in topology; skipping backup push.");
+        return;
+    };
 
-        // Try to send the notification
-        match TcpStream::connect(&pred_addr).await {
-            Ok(mut stream) => {
-                let line = format!("FILE NOTIFY-CHUNK-SAVED {}\n", chunk_name);
-                if let Err(e) = stream.write_all(line.as_bytes()).await {
-                    tracing::warn!(node = %node.port, target = %pred_addr, error = ?e, "Failed to send chunk notification.");
-                }
-                // No need to wait for an ACK
-                let _ = stream.shutdown().await;
-            }
-            Err(e) => {
-                tracing::warn!(node = %node.port, target = %pred_addr, error = ?e, "Failed to connect to predecessor for notification.");
-            }
+    let src_path = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("content")
+        .join(sanitize_filename(&chunk_name));
+
+    let mut f = match tokio::fs::File::open(&src_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(node = %node.port, chunk = %chunk_name, error = ?e, "Source chunk missing; cannot push backup.");
+            return;
         }
-    } else {
-        tracing::warn!(node = %node.port, chunk = %chunk_name, "No predecessor found in topology map. Cannot send backup notification.");
+    };
+    let size = match f.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            tracing::warn!(node = %node.port, chunk = %chunk_name, error = ?e, "Could not stat source chunk; skipping backup push.");
+            return;
+        }
+    };
+
+    let mut s = match TcpStream::connect(&pred_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Predecessor unreachable; skipping backup push.");
+            return;
+        }
+    };
+
+    let header = format!("FILE BACKUP-PUSH {} {}\n", chunk_name, size);
+    if let Err(e) = s.write_all(header.as_bytes()).await {
+        tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Failed to send BACKUP-PUSH header.");
+        return;
     }
-}
-
-/// Helper function for the backup process
-async fn request_chunk_for_backup(addr: &str, name: &str) -> Result<Vec<u8>, AnyErr> {
-    let mut s = TcpStream::connect(addr).await?;
-
-    // 1. Send the request
-    s.write_all(format!("FILE GET-CHUNK-FOR-BACKUP {}\n", name).as_bytes())
-        .await?;
-
-    // 2. Read the 8-byte size prefix
-    let mut size_buf = [0u8; 8];
-    s.read_exact(&mut size_buf).await?;
-    let size = u64::from_be_bytes(size_buf);
-
-    if size == 0 {
-        // This means the file was empty or not found
-        return Ok(Vec::new());
+    if size > 0 {
+        if let Err(e) = copy(&mut f, &mut s).await {
+            tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Failed to stream backup chunk body.");
+            return;
+        }
     }
+    let _ = s.shutdown().await;
 
-    // 3. Read exactly 'size' bytes of data
-    let mut buf = vec![0u8; size as usize];
-    s.read_exact(&mut buf).await?;
-
-    // The TcpStream 's' is dropped here when the task ends,
-    // closing the connection from the client side
-    Ok(buf)
+    tracing::info!(
+        node = %node.port,
+        predecessor = %pred_addr,
+        chunk = %chunk_name,
+        bytes = size,
+        "Pushed chunk to predecessor for backup."
+    );
 }
 
 // --- Gossip and Healing Functions
@@ -1607,6 +1632,16 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
         "Broadcasting node status"
     );
     node.broadcast_netmap_update().await;
+
+    // Tests disable respawn so a killed node stays dead — the rest of the
+    // ring's failover paths still get exercised.
+    if !node
+        .respawn_dead
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::info!(node = %node.port, dead_node = %full_dead_addr, "Respawn disabled; leaving node dead");
+        return Ok(());
+    }
 
     // 3. Start a new process
     tracing::info!(node = %node.port, respawn_addr = %full_dead_addr, "Respawning node");
@@ -1727,5 +1762,126 @@ async fn wait_until_listening(
                 sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fair_chunk_len_no_remainder() {
+        // 9 / 3 = 3, 3, 3
+        assert_eq!(fair_chunk_len(0, 9, 3), 3);
+        assert_eq!(fair_chunk_len(1, 9, 3), 3);
+        assert_eq!(fair_chunk_len(2, 9, 3), 3);
+    }
+
+    #[test]
+    fn fair_chunk_len_remainder_distributed_to_first() {
+        // 10 / 3 = 4, 3, 3
+        assert_eq!(fair_chunk_len(0, 10, 3), 4);
+        assert_eq!(fair_chunk_len(1, 10, 3), 3);
+        assert_eq!(fair_chunk_len(2, 10, 3), 3);
+    }
+
+    #[test]
+    fn fair_chunk_len_single_part() {
+        assert_eq!(fair_chunk_len(0, 100, 1), 100);
+    }
+
+    #[test]
+    fn fair_chunk_len_zero_size() {
+        for i in 0..5 {
+            assert_eq!(fair_chunk_len(i, 0, 5), 0);
+        }
+    }
+
+    #[test]
+    fn fair_chunk_len_one_byte_five_parts() {
+        assert_eq!(fair_chunk_len(0, 1, 5), 1);
+        for i in 1..5 {
+            assert_eq!(fair_chunk_len(i, 1, 5), 0);
+        }
+    }
+
+    #[test]
+    fn fair_chunk_len_sum_invariant() {
+        for &(parts, size) in &[(1u32, 1u64), (1, 1 << 20), (3, 7), (5, 1 << 20), (7, 123_456)] {
+            let total: u64 = (0..parts).map(|i| fair_chunk_len(i, size, parts)).sum();
+            assert_eq!(total, size, "parts={parts} size={size}");
+        }
+    }
+
+    #[test]
+    fn chunk_file_name_zero_padded() {
+        assert_eq!(
+            chunk_file_name("hello.txt", 0, 3),
+            "hello.txt.part-001-of-003"
+        );
+        assert_eq!(
+            chunk_file_name("hello.txt", 9, 10),
+            "hello.txt.part-010-of-010"
+        );
+    }
+
+    #[test]
+    fn chunk_file_name_sanitizes_slash() {
+        // sanitize_filename replaces '/' with '_'
+        let n = chunk_file_name("a/b", 0, 1);
+        assert!(!n.contains('/'), "got {n}");
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_bad_chars() {
+        assert_eq!(sanitize_filename("normal.txt"), "normal.txt");
+        assert_eq!(sanitize_filename("/abs/path"), "_abs_path");
+        assert_eq!(sanitize_filename("a\0b"), "a_b");
+        assert_eq!(sanitize_filename("a\nb"), "a_b");
+        assert_eq!(sanitize_filename("a:b"), "a_b");
+        assert_eq!(sanitize_filename("a;b"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_filename_empty_returns_underscore() {
+        assert_eq!(sanitize_filename(""), "_");
+    }
+
+    #[test]
+    fn sanitize_filename_preserves_unicode() {
+        // ASCII bad chars only; unicode passes through.
+        assert_eq!(sanitize_filename("héllo.txt"), "héllo.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_known_traversal_gap() {
+        // `.` is not in the bad-char set; `..` survives sanitization. Pin
+        // current behavior so refactors don't silently change it. A real fix
+        // belongs in a separate hardening PR.
+        assert_eq!(sanitize_filename("../etc/passwd"), ".._etc_passwd");
+    }
+
+    #[test]
+    fn csv_escape_basics() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_escape("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_escape(""), "");
+    }
+
+    #[test]
+    fn host_of_extracts() {
+        assert_eq!(host_of("127.0.0.1:7000"), "127.0.0.1");
+        assert_eq!(host_of("localhost:7000"), "localhost");
+        assert_eq!(host_of("7000"), "127.0.0.1");
+    }
+
+    #[test]
+    fn host_of_ipv6_bracket_pin() {
+        // Current `split(':')` does not handle IPv6 brackets correctly;
+        // it stops at the first colon. Pin the behavior so we know if a
+        // future fix changes it.
+        assert_eq!(host_of("[::1]:7000"), "[");
     }
 }

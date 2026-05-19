@@ -13,6 +13,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
+/// Reject Content-Length above this ceiling before opening a ring connection.
+/// 50 GB is generous enough that no legitimate upload hits it; an attacker
+/// declaring `u64::MAX` short-circuits without ever allocating.
+const MAX_REASONABLE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+
+/// Tag used so `handle_http_request` can map oversized-body errors to HTTP 413
+/// instead of the generic 500.
+const OVERSIZED_ERR_TAG: &str = "oversized:";
+
 #[derive(Debug)]
 pub struct Gateway {
     /// Full addresses
@@ -126,7 +135,15 @@ impl Gateway {
                 Ok(_) => {
                     Self::send_json_response(writer, serde_json::json!({"status": "ok"})).await
                 }
-                Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let (status, body) = if let Some(rest) = msg.strip_prefix(OVERSIZED_ERR_TAG) {
+                        (413u16, rest.to_string())
+                    } else {
+                        (500u16, msg)
+                    };
+                    Self::send_error_response(writer, status, &body).await
+                }
             },
             ("POST", "/network/heal") => match self.trigger_node_heal().await {
                 Ok(msg) => {
@@ -203,26 +220,36 @@ impl Gateway {
             return Err("Missing Content-Length or X-Filename header".into());
         }
 
+        // Reject absurd Content-Length before allocating *or* opening a ring
+        // connection. The ring node also rejects oversized PUSH (server-side
+        // bound), but stopping here saves an allocation and a hop.
+        if content_length > MAX_REASONABLE_BYTES {
+            return Err(format!(
+                "{}Content-Length {} exceeds {} bytes",
+                OVERSIZED_ERR_TAG, content_length, MAX_REASONABLE_BYTES
+            )
+            .into());
+        }
+
         let filename = filename.unwrap();
         let size = content_length;
 
         tracing::info!(file = %filename, bytes = size, "Receiving file from HTTP POST");
 
-        // 2. Read the raw body
-        let mut file_body = vec![0; size as usize];
-        reader.read_exact(&mut file_body).await?;
-
-        // 3. Connect to the ring
+        // 2. Connect to the ring before reading the body, so we don't buffer
+        //    a 50 GB upload in RAM if the ring is already unreachable.
         let mut node_stream = self.connect_to_ring().await?;
 
-        // 4. Send the FILE PUSH command
+        // 3. Send the FILE PUSH command.
         let header = format!("FILE PUSH {} {}\n", size, filename);
         node_stream.write_all(header.as_bytes()).await?;
 
-        // 5. Stream the file body to the node
-        node_stream.write_all(&file_body).await?;
+        // 4. Stream the body straight from the HTTP reader to the node.
+        //    `tokio::io::copy` uses a fixed internal buffer; no O(size) alloc.
+        let mut limited = (&mut *reader).take(size);
+        copy(&mut limited, &mut node_stream).await?;
 
-        // 6. Wait for the "OK" from the node to confirm success
+        // 5. Wait for the "OK" from the node to confirm success
         let mut node_reader = BufReader::new(node_stream);
         let mut node_response = String::new();
         let mut found_ok = false;

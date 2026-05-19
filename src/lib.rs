@@ -9,3 +9,6 @@ pub use node::Node;
 pub use node_status::NodeStatus;
 pub use protocol::{Command, parse_line};
 pub use server::run;
+
+#[doc(hidden)]
+pub use server::{bind, serve};
