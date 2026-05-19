@@ -41,6 +41,11 @@ pub struct Node {
     /// A map of every file in the system to its location
     pub file_tags: RwLock<HashMap<String, FileTag>>,
 
+    /// Filesystem root under which `<port>/content/` and `<port>/backup/` live.
+    /// The binary uses `PathBuf::from("nodes")`; tests pass a tempdir so
+    /// concurrent suites don't collide on disk.
+    pub storage_root: PathBuf,
+
     // ... other state for managing the network ...
 }
 ```
@@ -58,26 +63,40 @@ Every running Node starts a server that listens for incoming TCP connections. Th
 
 **File:** `src/server.rs`
 ```rust
-pub async fn run(bind_addr: &str, /*...*/) -> Result<(), AnyErr> {
-    // ... setup code to start listening on an address ...
-    let listener = /* ... */;
-    
-    // Initialize this node's state
-    let node = Node::new(/* ... */);
-    tracing::info!(node = %node.port, "Node listening");
+pub async fn bind(
+    bind_addr: &str,
+    gossip_interval: Duration,
+    file_size: u64,
+    storage_root: PathBuf,
+    respawn_dead: bool,
+) -> Result<(Arc<Node>, TcpListener, SocketAddr), AnyErr> {
+    // ... bind the socket, create node, mkdir storage_root/<port>/{content,backup} ...
+}
 
+pub async fn serve(node: Arc<Node>, listener: TcpListener) {
+    // Spawn the gossip loop, then accept connections forever.
     loop {
-        // Wait for a connection from a client or another node
-        let (stream, peer) = listener.accept().await?;
-        
-        // Handle the connection
-        tokio::spawn(async move {
-            handle_client(node, stream).await;
-        });
+        let (stream, peer) = listener.accept().await.expect("accept");
+        let node = Arc::clone(&node);
+        tokio::spawn(async move { handle_client(node, stream).await; });
     }
 }
+
+pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64)
+    -> Result<(), AnyErr>
+{
+    let (node, listener, _) = bind(
+        bind_addr, gossip_interval, file_size,
+        PathBuf::from("nodes"), /*respawn_dead=*/ true,
+    ).await?;
+    serve(node, listener).await;
+    Ok(())
+}
 ```
-This is the main loop for any Node. It waits for someone to connect (like our Gateway) and then passes the connection to `handle_client` to figure out what they want.
+This is the main loop for any Node. `bind` returns the resolved `SocketAddr`, which is what lets the
+in-process test harness use `127.0.0.1:0` (let the OS pick a free port) and then wire the ring
+*before* any node starts accepting. The binary takes the simpler `run` path; tests call `bind` and
+`serve` directly.
 
 ### Fulfilling the `FILE LIST` Request
 

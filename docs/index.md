@@ -5,7 +5,7 @@ called **Nodes**, into a self-healing *ring*. Instead of storing an entire file 
 **chunks** and distributes them around the ring, ensuring the system can survive and automatically recover from computer
 failures.
 
-**Source Repository:** [https://github.com/hazardous-sun/ouroboros-fs](https://github.com/hazardous-sun/ouroboros-fs)
+**Source Repository:** [https://github.com/adamjohannes/ouroboros-fs](https://github.com/adamjohannes/ouroboros-fs)
 
 ```mermaid
 flowchart TD

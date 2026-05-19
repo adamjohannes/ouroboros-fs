@@ -131,8 +131,8 @@ pub enum Command {
 
     // FILE (backup)
     /// Saving node pushes its just-saved chunk to its predecessor.
-    /// PR6 replaced the older notify-then-pull dance (NOTIFY-CHUNK-SAVED →
-    /// GET-CHUNK-FOR-BACKUP) with this single push, halving the round trips
+    /// Replaces an older notify-then-pull dance (NOTIFY-CHUNK-SAVED →
+    /// GET-CHUNK-FOR-BACKUP) with a single push, halving the round trips
     /// per saved chunk.
     FileBackupPush {
         name: String,
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn file_push_chunk() {
-        // PR7 7-field shape: name chunk_size file_size parts index start_port
+        // 6-field shape: name chunk_size file_size parts index start_port
         match parse_line("FILE PUSH-CHUNK myfile.part-002-of-005 4096 20480 5 1 7000")
             .unwrap()
         {
@@ -588,7 +588,7 @@ mod tests {
         assert!(parse_line("FILE PUSH-CHUNK n abc 1 1 0 7000").is_err());
         // Missing fields
         assert!(parse_line("FILE PUSH-CHUNK n 1").is_err());
-        // RELAY-STREAM is gone post-PR7; it must not parse.
+        // RELAY-STREAM was removed when the fan-out refactor landed; it must not parse.
         assert!(parse_line("FILE RELAY-STREAM tok 7000 1024 3 0 0 myfile").is_err());
     }
 

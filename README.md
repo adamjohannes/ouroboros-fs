@@ -1,7 +1,7 @@
 # OuroborosFS
 
-![Build Dev](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_dev.yml/badge.svg)
-![Build and Test Release](https://github.com/hazardous-sun/rust-socket-server/actions/workflows/build_and_test_release_release.yml/badge.svg)
+![Build Dev](https://github.com/adamjohannes/ouroboros-fs/actions/workflows/build_dev.yml/badge.svg)
+![Build and Test Release](https://github.com/adamjohannes/ouroboros-fs/actions/workflows/build_and_test_release_release.yml/badge.svg)
 
 ---
 
@@ -35,6 +35,7 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
    2. [Build the Backend](#32-build-the-backend)
    3. [Run a Network](#33-run-a-network)
    4. [Run the Web Dashboard (Optional)](#34-run-the-web-dashboard-optional)
+   5. [Running the Tests](#35-running-the-tests)
 4. [Protocol Overview](#4-protocol-overview)
    1. [Client Commands](#41-client-commands)
    2. [Internal (Node-to-Node) Commands](#42-internal-node-to-node-commands)
@@ -67,30 +68,38 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
 The system shards files across the network for distributed storage. Each node stores its chunks in a
 `nodes/<port>/content/` directory.
 
-* **File Push:**
+* **File Push (fan-out):**
 
-    1. A client sends a `FILE PUSH <size> <name>` command to any node.
-    2. That node determines the network size (N) from its known "netmap".
-    3. It reads the first chunk (1/N) of the file, saves it locally to its `content/` directory, and forwards the *rest*
-       of the file's binary stream to its neighbor using a `FILE RELAY-STREAM` command.
-    4. This process repeats: the next node saves chunk 2/N to its `content/` directory and forwards the rest. This
-       continues until all N chunks are stored on N different nodes.
+    1. A client sends a `FILE PUSH <size> <name>` command to any node — the *start node*.
+    2. The start node computes the chunk count from its known network size (`N`) and walks its topology
+       snapshot to identify each chunk's owner. Chunk `0` stays local; chunks `1..N-1` go to the next
+       `N-1` nodes around the ring.
+    3. It opens `N-1` outbound TCP connections **in parallel** and sends one
+       `FILE PUSH-CHUNK <chunk_name> <chunk_size> <file_size> <parts> <index> <start_port>` header per
+       connection up front.
+    4. As bytes arrive from the client it streams `fair_chunk_len(0)` bytes to its own
+       `content/` directory, then forwards `fair_chunk_len(1)` bytes to the conn for chunk 1,
+       `fair_chunk_len(2)` bytes to the conn for chunk 2, and so on.
+    5. After all bytes are forwarded, the start node awaits an `OK\n` ACK from each backend (with a
+       per-push deadline). Any failed connect, write, or ACK turns into an `ERR ...` response to the
+       client — the system favors visible, fast failure over partial saves.
 
-* **File Pull:**
+* **File Pull (parallel):**
 
     1. A client sends a `FILE PULL <name>` command to any node.
-    2. The node consults its internal `file_tags` map to find the file's size, its "start node" (holding chunk 1), and
-       the total number of `parts`.
-    3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (
-       e.g., `content.txt.part-002-of-003`).
-    4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
-       directory and returns it.
-    5. **Failure Path:** If the target node is dead (request fails), the originating node:
-       a. Marks the target node as `Dead` in its local netmap and broadcasts this update to the ring.
-       b. Finds the dead node's **predecessor** (which holds the backup).
-       c. Sends a `FILE GET-BACKUP-CHUNK` command to the predecessor, which reads the chunk from its `backup/` directory
-       and returns it.
-    6. The originating node reassembles all chunks in order and streams the complete file back to the client.
+    2. The node consults its internal `file_tags` map to find the file's size, its "start node"
+       (holding chunk 1), and the total number of `parts`.
+    3. It builds a fetch plan by walking the topology snapshot, then issues all chunk fetches
+       concurrently via `FuturesOrdered` with an in-flight cap of `4` (so a slow client can't
+       accumulate the whole file in RAM).
+    4. **Happy path:** Each fetch sends a `FILE GET-CHUNK` command to the chunk's owner; results are
+       streamed to the client in chunk-index order as they complete.
+    5. **Failure path:** If a chunk fetch fails, the originating node:
+       a. Records the dead port (deduped — at most one entry per dead host per pull).
+       b. Looks up the dead node's **predecessor** in a pre-built reverse map and sends
+          `FILE GET-BACKUP-CHUNK` to it.
+    6. After the loop completes, **one** netmap broadcast announces every dead host that surfaced
+       during the pull (pre-refactor, the same dead host could trigger N broadcasts).
 
 ### 2.2. Data Replication
 
@@ -103,15 +112,18 @@ For example, in a `7000 -> 7001 -> 7002` ring:
 - Node `7001` will back up data from Node `7002`.
 - Node `7002` will back up data from Node `7000`.
 
-This is achieved using an active notification workflow:
+This is achieved with a single push per chunk:
 
-1. **Store Content:** When Node `7001` receives a file chunk (e.g., `a.txt.part-002-of-003`), it saves it to its local
-   `nodes/7001/content/` directory.
-2. **Notify Predecessor:** Immediately after saving, Node `7001` sends a `FILE NOTIFY-CHUNK-SAVED` command to its
-   predecessor (Node `7000`), telling it the chunk name.
-3. **Fetch for Backup:** Node `7000` receives this notification, connects back to Node `7001`, and requests the full
-   chunk data using `FILE GET-CHUNK-FOR-BACKUP`.
-4. **Store Backup:** Node `7000` receives the data and saves it to its local `nodes/7000/backup/` directory.
+1. **Store Content:** When a node receives a chunk (e.g., `a.txt.part-002-of-003`), it streams the bytes
+   straight to its local `nodes/<port>/content/` directory.
+2. **Push to Predecessor:** Immediately after the local save flushes, the node spawns a fire-and-forget
+   task. The task opens a single TCP connection to its predecessor, sends
+   `FILE BACKUP-PUSH <chunk_name> <size>` followed by `<size>` raw bytes, and closes.
+3. **Store Backup:** The predecessor's `handle_file_backup_push` streams those bytes straight to its
+   own `nodes/<port>/backup/` directory and replies `OK\n`.
+
+If the predecessor is unreachable, the failure is logged and the local content save still stands —
+the chunk just isn't backed up until the next push for that chunk lands.
 
 ### 2.3. Fault Tolerance
 
@@ -188,6 +200,14 @@ cargo run --release -- set-network \
 
 This command will block, holding the network open.
 
+`set-network` also accepts `--file-size <bytes>` (default `1_000_000_000`, i.e., 1 GB) which caps the
+maximum size of a single accepted file per node. Pass `0` to disable the cap. The same flag exists on
+the `run` subcommand if you start nodes individually.
+
+Each node persists its chunks under `nodes/<port>/content/` and backups under `nodes/<port>/backup/`,
+rooted at the binary's working directory. The `Node` struct internally takes a `storage_root` parameter
+so the in-process test harness can redirect this to a tempdir; the binary always uses `nodes/`.
+
 ### 3.4. Run the Web Dashboard (Optional)
 
 The web dashboard is a separate Vue.js application. You'll need Node.js and `npm` installed.
@@ -230,6 +250,18 @@ the **gateway service** (e.g., on port 8000), you can point all scripts to that 
 
 # Get the status of all nodes (via the gateway)
 ./scripts/get_nodes.sh -p 8000
+
+# Trigger a manual ring-wide heal walk
+./scripts/heal_network.sh -p 8000
+
+# Kill a specific node by port
+./scripts/kill_node.sh 7002
+
+# Kill every node spawned by set-network
+./scripts/kill_all_nodes.sh
+
+# List node processes (lsof against the configured ports)
+./scripts/get_processes.sh
 ```
 
 #### Option B: Web Dashboard
@@ -241,6 +273,23 @@ You can use the dashboard to:
 - See a live-updating graph of all nodes and their status.
 - See a list of all files stored in the network.
 - Upload new files using the "Share File" button.
+
+### 3.5. Running the Tests
+
+The repository ships with a unit + integration test suite that runs in-process — no need to spin up
+a binary network. The integration harness spawns nodes inside the test runtime, wires them through
+ephemeral ports, and tears them down via `tempfile::TempDir`.
+
+```bash
+# Default suite (~3 s wall-clock)
+cargo test
+
+# Full suite including the 100 MB streaming round-trip
+cargo test --release -- --ignored
+```
+
+CI runs `cargo test --verbose` on every push and pull request — see
+`.github/workflows/build_and_test_release_release.yml`.
 
 ---
 
@@ -277,12 +326,12 @@ These commands are used by the nodes to communicate with each other.
 - **`NODE HEAL-DONE <token>`**: Sent by the last node back to the start to complete the heal walk.
 - **`NETMAP SET <entries>`**: Broadcasts an updated network map (e.g., `7000=Alive,7001=Dead`) to another node.
 - **`TOPOLOGY SET <history>`**: Broadcasts a complete topology map to another node.
-- **`FILE TAGS-SET <entries>`**: Broadcasts the map of known files to another node.
-- **`FILE RELAY-BLOB ...`**: Forwards a file chunk (and the remaining *blob*) to the next node during a `FILE PUSH`.
-- **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining *stream*) to the next node during a `FILE PUSH`.
+- **`FILE TAGS-SET <entries>`**: Broadcasts the map of known files to another node (used during heal).
+- **`FILE PUSH-CHUNK <name> <chunk_size> <file_size> <parts> <index> <start_port>`**: Sent by the start
+  node to each chunk owner during a `FILE PUSH`. Followed by exactly `<chunk_size>` raw bytes;
+  receiver replies `OK\n`.
 - **`FILE GET-CHUNK <name>`**: Requests a specific file chunk from another node during a `FILE PULL` operation.
-- **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -\> Node i) Notifies the predecessor node that a new chunk is
-  available for backup.
-- **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup.
+- **`FILE BACKUP-PUSH <name> <size>`**: Saving node pushes a just-saved chunk to its predecessor for
+  backup. Followed by exactly `<size>` raw bytes; receiver replies `OK\n`.
 - **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
   `/backup` directory. Used by `FILE PULL` as a failover.

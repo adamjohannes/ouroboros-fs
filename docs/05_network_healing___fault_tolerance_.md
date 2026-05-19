@@ -134,7 +134,7 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
     // Job 1: Mark the node as Dead and tell everyone.
     let dead_port = port_str(&dead_addr).to_string();
     
-    node.update_node_status(dead_port.clone(), "Dead").await;
+    node.update_node_status(dead_port.clone(), NodeStatus::Dead).await;
     node.broadcast_netmap_update().await;
     
     // ... more steps to follow ...
@@ -148,16 +148,25 @@ Next, the healer [Node](02_node_.md) acts like an operator and starts a brand ne
 ```rust
     // ... continued from above ...
 
-    // Job 2: Start a new process to replace the dead one.
-    let exe = env::current_exe()?; // Find our own program path
-    
+    // Job 2: Start a new process to replace the dead one — but only if
+    //        respawn is enabled. The test harness sets respawn_dead=false
+    //        on every Node so killing one in a test doesn't fork a real
+    //        binary that survives the test runtime.
+    if !node.respawn_dead.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let exe = current_exe()?;
     Command::new(exe)
         .arg("run")
-        .arg("--addr")
-        .arg(&dead_addr) // Relaunch on the same address
-        .spawn()?; // Start the command and let it run independently
+        .arg("--addr").arg(&dead_addr)
+        .arg("--wait-time").arg(node.gossip_interval.as_millis().to_string())
+        .spawn()?;
 ```
-This is just like you typing `ouroborosfs run --addr 127.0.0.1:7002` in your terminal. The system is programmatically running itself.
+This is just like you typing `ouroboros_fs run --addr 127.0.0.1:7002 --wait-time 5000` in your
+terminal. The system is programmatically running itself. The `respawn_dead` gate is the only
+production-relevant change to this code path — without it, the in-process integration test harness
+couldn't simulate failures.
 
 ### 3. Welcome the Newcomer
 
@@ -167,7 +176,7 @@ The newly spawned [Node](02_node_.md) is a blank slate. It knows nothing about t
     // ... continued from above ...
 
     // Job 3: Wait for the new node to start listening for connections.
-    wait_until_listening(&dead_addr).await?;
+    wait_until_listening(host, port, Duration::from_secs(10)).await?;
 
     // Now, send it all the information it needs to join the ring.
     share_data_with_new_node(&node, &dead_addr).await?;
@@ -182,7 +191,7 @@ Finally, once the new [Node](02_node_.md) is fully configured and ready, the hea
     // ... continued from above ...
 
     // Job 4: Mark the node as Alive and tell everyone.
-    node.update_node_status(dead_port.clone(), "Alive").await;
+    node.update_node_status(dead_port.clone(), NodeStatus::Alive).await;
     node.broadcast_netmap_update().await;
 
     tracing::info!("Healing process complete.");

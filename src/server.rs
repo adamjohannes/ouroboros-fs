@@ -711,9 +711,9 @@ fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
 /// per-target write-out + ACK-await: each target chunk has its own open
 /// TCP we write to in turn, and we await all `OK`s concurrently at the
 /// end. This means latency drops from O(N × hop) to O(longest hop) and
-/// failures are observed by the start node directly. PR7 also retired the
-/// dead `pending_files`/`finish_file` machinery on `Node`; ACK tracking
-/// now happens via the open outbound TCP connections instead.
+/// failures are observed by the start node directly. The fan-out refactor
+/// also retired the dead `pending_files`/`finish_file` machinery on `Node`;
+/// ACK tracking now happens via the open outbound TCP connections instead.
 async fn handle_file_push<R, W>(
     node: Arc<Node>,
     reader: &mut R,
@@ -969,7 +969,7 @@ where
         "Stored fan-out chunk"
     );
 
-    // Backup push to predecessor (PR6).
+    // Backup push to predecessor (push-based replication).
     let node_clone = Arc::clone(&node);
     let cn = name.clone();
     tokio::spawn(async move {
@@ -1051,12 +1051,9 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
 
 // --- BACKUP HANDLERS
 
-/// Handles "FILE NOTIFY-CHUNK-SAVED <name>"
-/// This node is the predecessor (i). It is being notified by its successor (i+1).
-/// It must now fetch the chunk from (i+1) and save it to its /backup dir.
 /// Handles "FILE BACKUP-PUSH <name> <size>" + raw bytes.
 ///
-/// PR6: replaces the older notify-then-pull dance. The saving node opens
+/// Replaces the older notify-then-pull dance. The saving node opens
 /// one connection to its predecessor, ships the chunk in a single round
 /// trip, gets `OK`. Bytes stream straight from the wire to disk — no
 /// `Vec<u8>` of size = chunk_size.
@@ -1183,8 +1180,8 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
             ));
             // Advance to the next node, even on the last iteration we don't
             // use it. If the topology is broken mid-walk we stop early —
-            // missing entries become "no chunks" (short output, see PR3
-            // regression pin).
+            // missing entries become "no chunks" (short output; see the
+            // streaming-pull truncation contract pinned in tests).
             let Some(next) = topology.get(&current_port).cloned() else {
                 tracing::error!(
                     node = %node.port,
@@ -1479,7 +1476,7 @@ async fn get_predecessor_addr(node: &Node) -> Option<String> {
 /// Helper to send the notification
 /// Push a just-saved chunk to this node's predecessor for backup.
 ///
-/// PR6: replaces the older `notify_predecessor` + `fetch_chunk_for_backup_to`
+/// Replaces the older `notify_predecessor` + `fetch_chunk_for_backup_to`
 /// dance. Two TCP setups + two round trips became one. Bytes stream straight
 /// from `/content` on the saving node to `/backup` on the predecessor — no
 /// `Vec<u8>` of size = chunk_size on either side.

@@ -123,8 +123,14 @@ pub async fn run_server(self: Arc<Self>, listen_addr: String) -> io::Result<()> 
     tracing::info!(addr = %listen_addr, "Gateway listening (HTTP + TCP)");
 
     loop {
-        let (client_stream, _) = listener.accept().await?;
-        // ... handle each new connection ...
+        let (client_stream, client_addr) = listener.accept().await?;
+        let gateway_clone = Arc::clone(&self);
+
+        tokio::spawn(async move {
+            if let Err(e) = gateway_clone.handle_connection(client_stream).await {
+                tracing::warn!(client = %client_addr, error = ?e, "Gateway client error");
+            }
+        });
     }
 }
 ```

@@ -48,12 +48,11 @@ This script is incredibly simple:
 2.  The `|` (pipe) sends that text as input to the `nc` (netcat) command.
 3.  `nc ${HOST} ${PORT}` is a basic networking utility that opens a connection to our [Node](02_node_.md) and sends the text it received.
 
-When the [Node](02_node_.md) receives this message, it will respond with the current network map, which might look something like this:
+When the [Node](02_node_.md) receives this message, it will respond with the current network map (one `port=Status` per line, no trailer). It might look something like this:
 ```
 7001=Alive
 7002=Alive
 7003=Alive
-OK
 ```
 
 ## Under the Hood: Parsing the Command
