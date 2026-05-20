@@ -40,6 +40,7 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
    1. [Client Commands](#41-client-commands)
    2. [Internal (Node-to-Node) Commands](#42-internal-node-to-node-commands)
 5. [Test Coverage](#5-test-coverage)
+6. [Further reading](#6-further-reading)
 
 ## 1. Core Features
 
@@ -389,3 +390,17 @@ included — they're pinned to a known deadlock and would hang the job.
   are pinned for after the proxy fix.
 
 [`cargo-llvm-cov`]: https://github.com/taiki-e/cargo-llvm-cov
+
+## 6. Further reading
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — single-page
+  architecture overview with sequence diagrams (PUSH, PULL, heal).
+- [`docs/operations.md`](docs/operations.md) — operator's guide:
+  deployment, capacity planning, runbook, version-upgrade,
+  cluster-level backup, incident-response template.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, trust
+  boundary, DoS surface, roadmap toward mTLS.
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
+- [`samples/systemd/`](samples/systemd/) — systemd unit files for
+  production deploy.
+- [`samples/config/`](samples/config/) — TOML config templates.
