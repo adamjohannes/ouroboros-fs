@@ -464,6 +464,9 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 protocol::Command::FileGetBackupChunk { name } => {
                     handle_file_get_backup_chunk(&node, &mut writer, name).await?
                 }
+                protocol::Command::FileContentPush { name, size } => {
+                    handle_file_content_push(&node, &mut reader, &mut writer, name, size).await?
+                }
             },
             Err(e) => handle_error(&mut writer, e).await?,
         }
@@ -1472,6 +1475,39 @@ where
     Ok(())
 }
 
+/// Receive a §1.5b anti-entropy push from the predecessor: write the
+/// chunk into our own content/ directory. Used by `share_data_with_new_node`
+/// after respawn to refill chunks the dead node lost on disk.
+async fn handle_file_content_push<R, W>(
+    node: &Node,
+    reader: &mut R,
+    writer: &mut W,
+    name: String,
+    size: u64,
+) -> Result<(), AnyErr>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let dir = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("content");
+    fs::create_dir_all(&dir).await.ok();
+    durably_write_chunk(&dir, &name, reader, size, node.fsync_mode).await?;
+
+    tracing::info!(
+        node = %node.port,
+        chunk = %name,
+        bytes = size,
+        path = %dir.join(&name).display(),
+        "Content chunk received via anti-entropy refill."
+    );
+
+    writer.write_all(b"OK\n").await?;
+    Ok(())
+}
+
 /// Handles "FILE GET-BACKUP-CHUNK <name>"
 /// This is used by the PULL failover process. It reads from the "/backup" dir
 /// and returns a standard FILE RESP-CHUNK.
@@ -2180,6 +2216,125 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
         s_next.shutdown().await?;
     }
 
+    // Anti-entropy refill (NEXT_STEPS.md §1.5b). The respawned node may
+    // have lost its on-disk state if its storage_root was destroyed (disk
+    // failure, accidental rm -rf). Walk our own backup/ — which holds
+    // exactly the chunks the respawned node should serve from content/ —
+    // and push each one back as a FILE CONTENT-PUSH. The receiver's
+    // durably_write_chunk overwrites whatever it had (chunks are
+    // immutable in practice; if they differed, the respawned copy was
+    // corrupt). Best-effort: failures here log but don't abort the heal,
+    // because the predecessor backup still works as a PULL fall-through.
+    if let Err(e) = anti_entropy_refill_successor(node, new_node_addr).await {
+        tracing::warn!(
+            node = %node.port,
+            target = %new_node_addr,
+            error = ?e,
+            "Anti-entropy refill failed; respawned node will rely on PULL fall-through"
+        );
+    }
+
+    Ok(())
+}
+
+/// Walk our `<storage_root>/<port>/backup/` directory and push every
+/// chunk we find to the freshly-respawned successor as
+/// `FILE CONTENT-PUSH`. The successor writes them into its content/
+/// directory. Skips orphan `*.partial` files (the startup janitor will
+/// also sweep these on the receiver side).
+async fn anti_entropy_refill_successor(
+    node: &Node,
+    successor_addr: &str,
+) -> Result<(), AnyErr> {
+    let backup_dir = node
+        .storage_root
+        .join(port_str(&node.port))
+        .join("backup");
+    let mut entries = match fs::read_dir(&backup_dir).await {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(node = %node.port, "No backup/ dir; nothing to refill");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("partial") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Read the chunk through the verified-open helper so we never
+        // ship a corrupt body. The helper strips the SHA-256 trailer
+        // so the receiver re-hashes its own.
+        let body = match open_chunk_verified(&path).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    node = %node.port,
+                    chunk = %name,
+                    error = ?e,
+                    "Anti-entropy: skipping unverifiable backup chunk"
+                );
+                continue;
+            }
+        };
+        if let Err(e) = push_content_to(node, successor_addr, name, &body).await {
+            tracing::warn!(
+                node = %node.port,
+                target = %successor_addr,
+                chunk = %name,
+                error = ?e,
+                "Anti-entropy: failed to push chunk; continuing"
+            );
+            continue;
+        }
+        count += 1;
+        bytes += body.len() as u64;
+    }
+
+    if count > 0 {
+        tracing::info!(
+            node = %node.port,
+            target = %successor_addr,
+            chunks = count,
+            bytes,
+            "Anti-entropy refill complete"
+        );
+    }
+    Ok(())
+}
+
+async fn push_content_to(
+    node: &Node,
+    addr: &str,
+    name: &str,
+    body: &[u8],
+) -> Result<(), AnyErr> {
+    let mut s = TcpStream::connect(addr).await?;
+    send_auth(&mut s, &node.auth_token).await?;
+    let header = format!("FILE CONTENT-PUSH {} {}\n", name, body.len());
+    s.write_all(header.as_bytes()).await?;
+    if !body.is_empty() {
+        s.write_all(body).await?;
+    }
+    // Read the OK ack so we don't race the receiver's fsync.
+    let mut reader = BufReader::new(&mut s);
+    let mut buf = String::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        reader.read_line(&mut buf),
+    )
+    .await
+    .map_err(|_| "anti-entropy ack timed out")?;
+    if !buf.starts_with("OK") {
+        return Err(format!("CONTENT-PUSH did not OK: {buf:?}").into());
+    }
     Ok(())
 }
 

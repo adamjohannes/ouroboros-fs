@@ -644,22 +644,37 @@ where
     where
         R: AsyncRead + Unpin,
     {
-        // 1. Connect to node
+        // 1. Connect to node (with AUTH already sent by connect_to_ring).
         let mut node_stream = self.connect_to_ring().await?;
         tracing::debug!(addr = ?node_stream.peer_addr(), "Gateway connected to ring node");
 
-        // 2. Send the first line
+        // 2. Send the first line (the request the client sent us).
         node_stream.write_all(first_line.as_bytes()).await?;
 
-        // 3. Proxy all remaining data in both directions
+        // 3. Bidirectional copy with explicit half-shutdown.
+        //
+        // The original deadlock (NEXT_STEPS.md §3.3): both halves of
+        // `try_join!(client→server, server→client)` only return on EOF
+        // of their reader. The ring's `handle_client` is a loop — it
+        // doesn't close after one command — so it only EOFs when the
+        // gateway shuts down the write half. The fix: as soon as the
+        // client→server copy completes (the client shut down its write
+        // half, signaling "request done"), explicitly shut down our
+        // node_write half. The ring then sees EOF, exits its read loop,
+        // closes its write half, and the server→client copy returns.
         let (mut node_read, mut node_write) = node_stream.split();
-
-        // `client_reader` is the BufReader, which will empty its
-        // internal buffer first before reading from the underlying stream.
-        let client_to_server = copy(&mut client_reader, &mut node_write);
+        let client_to_server = async {
+            let r = copy(&mut client_reader, &mut node_write).await;
+            // Shut down the write half regardless of copy result so the
+            // ring sees a clean EOF and stops looping. The shutdown can
+            // race the copy itself (both write through node_write), but
+            // tokio's AsyncWriteExt::shutdown is idempotent w.r.t. error
+            // semantics — failure is logged-and-swallowed.
+            let _ = node_write.shutdown().await;
+            r
+        };
         let server_to_client = copy(&mut node_read, &mut client_writer);
 
-        // Use `try_join!` to wait for both halves to complete.
         match tokio::try_join!(client_to_server, server_to_client) {
             Ok(_) => {
                 tracing::debug!("TCP proxy finished successfully.");

@@ -42,6 +42,12 @@
 //!   - "FILE BACKUP-PUSH <name> <size>"  (node -> predecessor; raw bytes follow)
 //!   - "FILE GET-BACKUP-CHUNK <name>"    (PULL failover: backup-holder serves)
 //!
+//! FILE (anti-entropy)
+//!   - "FILE CONTENT-PUSH <name> <size>" (predecessor -> respawned successor;
+//!                                         re-fills missing content/ chunks
+//!                                         after respawn from the backup/
+//!                                         the predecessor already holds)
+//!
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
 
@@ -175,6 +181,20 @@ pub enum Command {
     FileGetBackupChunk {
         name: String,
     }, // "FILE GET-BACKUP-CHUNK <name>"
+
+    // FILE (anti-entropy on respawn)
+    /// Predecessor pushes a chunk it holds in its `backup/` directory
+    /// into the respawned successor's `content/` directory. Used to
+    /// re-fill on-disk state after a respawn whose `storage_root` was
+    /// destroyed (e.g., disk failure). The receiver's content/<name>
+    /// is overwritten if present, so this is also self-healing for
+    /// silently-corrupt content (since the integrity trailer would have
+    /// failed verify and triggered the predecessor backup fall-through
+    /// at PULL time).
+    FileContentPush {
+        name: String,
+        size: u64,
+    }, // "FILE CONTENT-PUSH <name> <size>"
 }
 
 /// Parse one incoming line from the wire into a Command.
@@ -394,6 +414,21 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
             .parse::<u64>()
             .map_err(|_| "invalid size for FILE BACKUP-PUSH")?;
         return Ok(Command::FileBackupPush { name, size });
+    }
+
+    // CONTENT-PUSH (predecessor → respawned successor; anti-entropy)
+    if let Some(rest) = rest.strip_prefix("CONTENT-PUSH ") {
+        let mut parts = rest.splitn(2, ' ');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let size_str = parts.next().unwrap_or("").trim();
+        if name.is_empty() {
+            return Err("missing file name for FILE CONTENT-PUSH".into());
+        }
+        validate_filename(&name).map_err(|e| format!("FILE CONTENT-PUSH: {e}"))?;
+        let size = size_str
+            .parse::<u64>()
+            .map_err(|_| "invalid size for FILE CONTENT-PUSH")?;
+        return Ok(Command::FileContentPush { name, size });
     }
 
     // GET-BACKUP-CHUNK

@@ -407,7 +407,6 @@ async fn gateway_connect_to_ring_all_dead_returns_500() {
 // fix to the proxy with `cargo test gateway_tcp_proxy -- --ignored`.
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn gateway_tcp_proxy_passes_through_node_status() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -427,7 +426,6 @@ async fn gateway_tcp_proxy_passes_through_node_status() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn gateway_tcp_proxy_passes_through_file_push_pull() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let payload = rand_bytes(/*seed=*/ 420, 256);
