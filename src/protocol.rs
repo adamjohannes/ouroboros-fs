@@ -44,6 +44,38 @@
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
 
+/// Strict filename validator. Allowlist: ASCII alphanumerics, `.`, `-`, `_`.
+/// Empty rejected; length capped at 255 bytes. Names that consist only of
+/// dots (`.`, `..`, `...`) are also rejected — they're either path-special
+/// or useless basenames. Server-generated chunk names
+/// (`<base>.part-NNN-of-MMM`) satisfy this allowlist by construction.
+///
+/// Applied at the parse boundary so handlers never see traversal sequences
+/// (`..`), separators (`/`, `\`), control bytes, or anything that confuses
+/// disk-layout / CSV-list code paths.
+pub fn validate_filename(name: &str) -> Result<&str, &'static str> {
+    if name.is_empty() {
+        return Err("filename is empty");
+    }
+    if name.len() > 255 {
+        return Err("filename too long");
+    }
+    let mut all_dots = true;
+    for b in name.as_bytes() {
+        let ok = b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-' | b'_');
+        if !ok {
+            return Err("filename contains disallowed character");
+        }
+        if *b != b'.' {
+            all_dots = false;
+        }
+    }
+    if all_dots {
+        return Err("filename consists only of dots");
+    }
+    Ok(name)
+}
+
 /// Parsed representation of a command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -301,10 +333,11 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
     if let Some(rest) = rest.strip_prefix("PUSH ") {
         let mut parts = rest.splitn(2, ' ');
         let size_str = parts.next().unwrap_or("").trim();
-        let name = parts.next().unwrap_or("").to_string();
+        let name = parts.next().unwrap_or("").trim().to_string();
         if name.is_empty() {
             return Err("missing file name for FILE PUSH".into());
         }
+        validate_filename(&name).map_err(|e| format!("FILE PUSH: {e}"))?;
         let size = size_str
             .parse::<u64>()
             .map_err(|_| "invalid size for FILE PUSH")?;
@@ -313,10 +346,11 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
 
     // PULL
     if let Some(rest) = rest.strip_prefix("PULL ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() {
+        let name = rest.trim().to_string();
+        if name.is_empty() {
             return Err("missing file name for FILE PULL".into());
         }
+        validate_filename(&name).map_err(|e| format!("FILE PULL: {e}"))?;
         return Ok(Command::FilePull { name });
     }
 
@@ -334,10 +368,11 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
 
     // GET-CHUNK
     if let Some(rest) = rest.strip_prefix("GET-CHUNK ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() {
+        let name = rest.trim().to_string();
+        if name.is_empty() {
             return Err("missing file name for FILE GET-CHUNK".into());
         }
+        validate_filename(&name).map_err(|e| format!("FILE GET-CHUNK: {e}"))?;
         return Ok(Command::FileGetChunk { name });
     }
 
@@ -349,6 +384,7 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
         if name.is_empty() {
             return Err("missing file name for FILE BACKUP-PUSH".into());
         }
+        validate_filename(&name).map_err(|e| format!("FILE BACKUP-PUSH: {e}"))?;
         let size = size_str
             .parse::<u64>()
             .map_err(|_| "invalid size for FILE BACKUP-PUSH")?;
@@ -357,10 +393,11 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
 
     // GET-BACKUP-CHUNK
     if let Some(rest) = rest.strip_prefix("GET-BACKUP-CHUNK ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() {
+        let name = rest.trim().to_string();
+        if name.is_empty() {
             return Err("missing file name for FILE GET-BACKUP-CHUNK".into());
         }
+        validate_filename(&name).map_err(|e| format!("FILE GET-BACKUP-CHUNK: {e}"))?;
         return Ok(Command::FileGetBackupChunk { name });
     }
 
@@ -376,6 +413,7 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
         if name.is_empty() {
             return Err("missing name for FILE PUSH-CHUNK".into());
         }
+        validate_filename(&name).map_err(|e| format!("FILE PUSH-CHUNK: {e}"))?;
         let chunk_size = chunk_size_str
             .parse::<u64>()
             .map_err(|_| "invalid chunk_size for FILE PUSH-CHUNK")?;
@@ -820,6 +858,36 @@ mod tests {
     #[test]
     fn file_get_backup_chunk_empty_errs() {
         assert!(parse_line("FILE GET-BACKUP-CHUNK   ").is_err());
+    }
+
+    #[test]
+    fn file_push_traversal_name_rejected_at_parse() {
+        // Strict allowlist is enforced at parse — handlers never see `..`.
+        assert!(parse_line("FILE PUSH 0 ..").is_err());
+        assert!(parse_line("FILE PUSH 0 ../etc/passwd").is_err());
+        assert!(parse_line("FILE PUSH 0 a/b").is_err());
+        assert!(parse_line("FILE PUSH 0 a\\b").is_err());
+        assert!(parse_line("FILE PUSH 0 a b").is_err());
+        assert!(parse_line("FILE PUSH 0 a:b").is_err());
+    }
+
+    #[test]
+    fn file_pull_traversal_name_rejected_at_parse() {
+        assert!(parse_line("FILE PULL ..").is_err());
+        assert!(parse_line("FILE PULL ../foo").is_err());
+    }
+
+    #[test]
+    fn file_backup_push_traversal_name_rejected_at_parse() {
+        assert!(parse_line("FILE BACKUP-PUSH .. 100").is_err());
+    }
+
+    #[test]
+    fn file_push_chunk_traversal_name_rejected_at_parse() {
+        // Even on the internal-only PUSH-CHUNK channel, the parser refuses.
+        // Defense in depth: the auth layer (Series C) would also block this,
+        // but a peer-compromise scenario shouldn't widen this surface.
+        assert!(parse_line("FILE PUSH-CHUNK .. 1 1 1 0 7000").is_err());
     }
 
     #[test]

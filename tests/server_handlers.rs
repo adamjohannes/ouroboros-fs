@@ -260,26 +260,26 @@ async fn file_list_csv_one_row_format() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_list_csv_quotes_names_with_commas() {
+async fn file_push_rejects_filename_with_comma() {
+    // After Series A, names that contain `,` (or `"`, etc.) are rejected at
+    // the parse layer rather than CSV-escaped at FILE LIST time. The CSV
+    // escape function is still exercised as a unit test in server.rs.
     let ring = spin_up(RingOpts::default()).await;
-    push_bytes(ring.addr(0), "a,b.bin", b"x").await.unwrap();
-    let resp = send_line(ring.addr(0), "FILE LIST\n").await.unwrap();
+    let res = push_bytes(ring.addr(0), "a,b.bin", b"x").await;
     assert!(
-        resp.contains(r#""a,b.bin""#),
-        "expected quoted name: {resp:?}"
+        res.is_err(),
+        "expected push of comma-named file to be rejected, got {res:?}"
     );
     shutdown(ring).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_list_csv_doubles_inner_quotes() {
+async fn file_push_rejects_filename_with_quote() {
     let ring = spin_up(RingOpts::default()).await;
-    push_bytes(ring.addr(0), "a\"b", b"x").await.unwrap();
-    let resp = send_line(ring.addr(0), "FILE LIST\n").await.unwrap();
-    // Doubled quotes per CSV escaping: a"b → "a""b"
+    let res = push_bytes(ring.addr(0), "a\"b", b"x").await;
     assert!(
-        resp.contains(r#""a""b""#),
-        "expected doubled-quote name: {resp:?}"
+        res.is_err(),
+        "expected push of quoted-name file to be rejected, got {res:?}"
     );
     shutdown(ring).await;
 }

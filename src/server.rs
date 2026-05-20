@@ -1,7 +1,7 @@
 use std::error::Error;
-use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf};
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
@@ -13,7 +13,7 @@ use tracing;
 
 use crate::{
     node::{self, Node, append_edge, port_str},
-    protocol,
+    protocol::{self, validate_filename},
 };
 
 type AnyErr = Box<dyn Error + Send + Sync>;
@@ -696,8 +696,8 @@ fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
 }
 
 fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
-    let safe = sanitize_filename(name);
-    format!("{}.part-{:03}-of-{:03}", safe, index + 1, parts)
+    debug_assert!(validate_filename(name).is_ok(), "unvalidated name {name:?}");
+    format!("{}.part-{:03}-of-{:03}", name, index + 1, parts)
 }
 
 // --- FILE: PUSH (fan-out) handlers
@@ -739,12 +739,7 @@ where
         return Ok(());
     }
 
-    let name = Path::new(&name)
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    debug_assert!(validate_filename(&name).is_ok(), "unvalidated name {name:?}");
 
     let parts: u32 = node.network_size().await as u32;
     let start_port_num: u16 = port_str(&node.port).parse().unwrap_or(0);
@@ -759,7 +754,7 @@ where
             .storage_root
             .join(port_str(&node.port))
             .join("content")
-            .join(sanitize_filename(&chunk_name));
+            .join(&chunk_name);
         let mut f = tokio::fs::File::create(&path).await?;
         let mut limited = (&mut *reader).take(size);
         copy(&mut limited, &mut f).await?;
@@ -844,7 +839,7 @@ where
         .storage_root
         .join(port_str(&node.port))
         .join("content")
-        .join(sanitize_filename(&chunk0_name));
+        .join(&chunk0_name);
     let mut chunk0 = tokio::fs::File::create(&chunk0_path).await?;
     let len0 = fair_chunk_len(0, size, parts);
     {
@@ -952,7 +947,7 @@ where
         .storage_root
         .join(port_str(&node.port))
         .join("content")
-        .join(sanitize_filename(&name));
+        .join(&name);
     let mut file = tokio::fs::File::create(&path).await?;
     if chunk_size > 0 {
         let mut limited = reader.take(chunk_size);
@@ -1023,7 +1018,7 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
         .storage_root
         .join(port_str(&node.port))
         .join("content")
-        .join(sanitize_filename(&name));
+        .join(&name);
 
     // Stream the chunk straight from disk to the wire (no full-chunk Vec).
     // Open first so the metadata().len() we announce matches the bytes we
@@ -1068,12 +1063,11 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let fname = sanitize_filename(&name);
     let dest_path = node
         .storage_root
         .join(port_str(&node.port))
         .join("backup")
-        .join(&fname);
+        .join(&name);
 
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).await.ok();
@@ -1112,7 +1106,7 @@ async fn handle_file_get_backup_chunk<W: AsyncWrite + Unpin>(
         .storage_root
         .join(port_str(&node.port))
         .join("backup")
-        .join(sanitize_filename(&name));
+        .join(&name);
 
     // Same streaming pattern as GET-CHUNK, against the /backup dir.
     let mut f = match tokio::fs::File::open(&chunk_path).await {
@@ -1408,26 +1402,6 @@ async fn handle_error<W: AsyncWrite + Unpin>(writer: &mut W, err: String) -> Res
     Ok(())
 }
 
-fn sanitize_filename(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        let bad = ch == '/'
-            || ch == '\\'
-            || ch == '\0'
-            || ch == ':'
-            || ch == '|'
-            || ch == ';'
-            || ch == '\n'
-            || ch == '\r';
-        if bad {
-            out.push('_');
-        } else {
-            out.push(ch);
-        }
-    }
-    if out.is_empty() { "_".into() } else { out }
-}
-
 /// Minimal CSV escaping for names containing commas, quotes, or newlines.
 fn csv_escape(s: &str) -> String {
     let needs_quotes = s.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r'));
@@ -1495,7 +1469,7 @@ async fn push_to_predecessor(node: Arc<Node>, chunk_name: String) {
         .storage_root
         .join(port_str(&node.port))
         .join("content")
-        .join(sanitize_filename(&chunk_name));
+        .join(&chunk_name);
 
     let mut f = match tokio::fs::File::open(&src_path).await {
         Ok(f) => f,
@@ -1823,39 +1797,68 @@ mod tests {
     }
 
     #[test]
-    fn chunk_file_name_sanitizes_slash() {
-        // sanitize_filename replaces '/' with '_'
-        let n = chunk_file_name("a/b", 0, 1);
-        assert!(!n.contains('/'), "got {n}");
+    #[should_panic]
+    fn chunk_file_name_panics_on_unvalidated_name() {
+        // The validator (parse layer) rejects '/'; chunk_file_name's
+        // debug_assert! pins this invariant so a regression in the dispatch
+        // path that bypasses validation triggers loudly in tests.
+        let _ = chunk_file_name("a/b", 0, 1);
     }
 
     #[test]
-    fn sanitize_filename_replaces_bad_chars() {
-        assert_eq!(sanitize_filename("normal.txt"), "normal.txt");
-        assert_eq!(sanitize_filename("/abs/path"), "_abs_path");
-        assert_eq!(sanitize_filename("a\0b"), "a_b");
-        assert_eq!(sanitize_filename("a\nb"), "a_b");
-        assert_eq!(sanitize_filename("a:b"), "a_b");
-        assert_eq!(sanitize_filename("a;b"), "a_b");
+    fn validate_filename_accepts_allowlist() {
+        assert!(validate_filename("normal.txt").is_ok());
+        assert!(validate_filename("already-safe.bin").is_ok());
+        assert!(validate_filename("under_score").is_ok());
+        assert!(validate_filename("foo.bin.part-001-of-003").is_ok());
     }
 
     #[test]
-    fn sanitize_filename_empty_returns_underscore() {
-        assert_eq!(sanitize_filename(""), "_");
+    fn validate_filename_rejects_path_separators() {
+        assert!(validate_filename("/abs/path").is_err());
+        assert!(validate_filename("a/b").is_err());
+        assert!(validate_filename("a\\b").is_err());
     }
 
     #[test]
-    fn sanitize_filename_preserves_unicode() {
-        // ASCII bad chars only; unicode passes through.
-        assert_eq!(sanitize_filename("héllo.txt"), "héllo.txt");
+    fn validate_filename_rejects_traversal() {
+        // The whole point of replacing sanitize_filename: `..` doesn't pass.
+        assert!(validate_filename("..").is_err());
+        assert!(validate_filename(".").is_err());
+        assert!(validate_filename("...").is_err());
+        // Path separators inside a name with `..` are also blocked (twice over).
+        assert!(validate_filename("../etc/passwd").is_err());
+        // A name that *contains* dots but has at least one other char is fine.
+        assert!(validate_filename(".hidden").is_ok());
+        assert!(validate_filename("a.b").is_ok());
     }
 
     #[test]
-    fn sanitize_filename_known_traversal_gap() {
-        // `.` is not in the bad-char set; `..` survives sanitization. Pin
-        // current behavior so refactors don't silently change it. A real fix
-        // belongs in a separate hardening PR.
-        assert_eq!(sanitize_filename("../etc/passwd"), ".._etc_passwd");
+    fn validate_filename_rejects_control_and_punctuation() {
+        assert!(validate_filename("a\0b").is_err());
+        assert!(validate_filename("a\nb").is_err());
+        assert!(validate_filename("a:b").is_err());
+        assert!(validate_filename("a;b").is_err());
+        assert!(validate_filename("a|b").is_err());
+        assert!(validate_filename("a b").is_err());
+        assert!(validate_filename("a,b").is_err());
+        assert!(validate_filename("a\"b").is_err());
+    }
+
+    #[test]
+    fn validate_filename_rejects_empty_and_oversize() {
+        assert!(validate_filename("").is_err());
+        let huge = "a".repeat(256);
+        assert!(validate_filename(&huge).is_err());
+        let max = "a".repeat(255);
+        assert!(validate_filename(&max).is_ok());
+    }
+
+    #[test]
+    fn validate_filename_rejects_non_ascii() {
+        // The allowlist is ASCII-only by design — disk encoding, CSV, and
+        // wire formatting all assume single-byte name handling.
+        assert!(validate_filename("héllo.txt").is_err());
     }
 
     #[test]
@@ -1930,16 +1933,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_filename_replaces_pipe_and_backslash() {
-        assert_eq!(sanitize_filename("a|b"), "a_b");
-        assert_eq!(sanitize_filename("a\\b"), "a_b");
-    }
-
-    #[test]
-    fn sanitize_filename_idempotent_on_safe_input() {
-        let s = "already-safe.bin";
-        assert_eq!(sanitize_filename(s), s);
-        assert_eq!(sanitize_filename(&sanitize_filename(s)), s);
+    fn chunk_file_name_appended_to_validated_input_still_validates() {
+        // Server-generated chunk names satisfy the allowlist by construction:
+        // the suffix `.part-NNN-of-MMM` is alphanum + '.' + '-'.
+        let n = chunk_file_name("foo.bin", 0, 3);
+        assert!(validate_filename(&n).is_ok(), "got {n}");
     }
 
     #[test]
