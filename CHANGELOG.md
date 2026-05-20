@@ -11,10 +11,42 @@ P2 sweep = J–M).
 
 ## [Unreleased]
 
-## [1.0.0-rc.1] — 2026-05-20
+## [2.0.0] — 2026-05-20
 
-First release candidate. Closes every P0 and P1 item from
-`NEXT_STEPS.md`, plus most P2 items.
+Major release. Closes every P0 and P1 item from `NEXT_STEPS.md`, plus
+most P2 items. The version jump from 1.0.0 → 2.0.0 reflects a number
+of semver-major breaks documented below.
+
+### Breaking changes since v1.0.0
+
+A v1.0.0 client cannot talk to a v2.0.0 cluster when auth is enabled,
+and v1.0.0 on-disk chunks are not readable by v2.0.0 nodes. Concretely:
+
+- **Wire protocol**: every accepted connection's first line must now
+  be `AUTH <hmac> <nonce>` (skipped only when the cluster is
+  configured with no token — development mode). New `FILE
+  CONTENT-PUSH` and `NODE METRICS` commands. PULL response gains a
+  `\nERR truncated …\n` trailer when chunks are unrecoverable.
+- **Storage format**: every saved chunk now has a 32-byte SHA-256
+  trailer (`body || sha256(body)`); pre-v2 chunks fail integrity
+  verification on read. A `VERSION` marker file is written per
+  per-node directory; nodes refuse to start on an unversioned tree
+  unless `OUROBOROS_FORCE_V1=1` is set.
+- **HTTP API**: every non-OPTIONS request requires
+  `Authorization: Bearer <hex>` (auth-enabled clusters). `POST
+  /node/<port>/kill` is **removed**; `Access-Control-Allow-Origin: *`
+  is **removed**. New `/health`, `/ready`, `/metrics` endpoints.
+  `GET /file/pull/<missing>` now returns 404 instead of 200 + ERR
+  body.
+- **CLI**: `set-network` renamed to `dev-network` (alias retained
+  for one release). Many new flags on `run`: `--storage-root`,
+  `--fsync-mode`, `--auth-token`, `--idle-timeout`, `--max-conns`,
+  `--shutdown-timeout`, `--config`, `--log-format`. New standalone
+  `gateway` subcommand for production deploys.
+- **Rust public API**: `Gateway::with_auth` constructor added.
+  `run` signature grew from `(addr, gossip, file_size)` to a 9-arg
+  form. `Node::new` similarly grew. `serve_with_shutdown` exported.
+  Library users on v1.0.0 will not compile without source changes.
 
 ### Added
 
@@ -134,6 +166,19 @@ harness; they're not stable across patch releases. `Node` is
 re-exported normally (it's part of the public surface so users can
 read its fields), but its layout is not stable across major versions
 — treat it as opaque except for documented accessors.
+
+## [1.0.0] — Pre-this-release
+
+`v1.0.0` was tagged earlier (see `git tag -l "v1.0*"` for the exact
+commit). It corresponds to the pre-rewrite tree: ring-topology file
+store with fan-out PUSH, parallel-fetch PULL, predecessor-backup
+replication, gossip-driven failover, and a basic test harness. None
+of the v2.0.0 hardening (auth, durability trailer, graceful shutdown,
+metrics, anti-entropy refill, etc.) is present at v1.0.0.
+
+The `v1.0.0-rc.1` tag pushed during the v2.0.0 release work was
+withdrawn — the rc never matched a stable release because the version
+number was reused. v2.0.0 is the actual release of this work.
 
 ## [0.1.0] — Pre-1.0 history
 
