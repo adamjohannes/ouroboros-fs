@@ -207,7 +207,7 @@ async fn netmap_get_returns_alive_lines_then_ok() {
 async fn netmap_get_empty_state_returns_empty_marker() {
     // Bypass spin_up's convergence: build a single-node ring without
     // running NETMAP DISCOVER, then GET. Reuses bind+serve directly.
-    use ouroboros_fs::{FsyncMode, bind, serve};
+    use ouroboros_fs::{AuthToken, FsyncMode, bind, serve};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -219,6 +219,7 @@ async fn netmap_get_empty_state_returns_empty_marker() {
         tmp.path().to_path_buf(),
         false,
         FsyncMode::None,
+        AuthToken::disabled(),
     )
     .await
     .unwrap();

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::{
-    GatewayHandle, RingOpts, http_get, http_options, http_post, kill_node, pull_bytes,
-    push_bytes, rand_bytes, sha256, shutdown, spin_up_with_gateway,
+    RingOpts, http_get, http_options, http_post, kill_node, pull_bytes, push_bytes, rand_bytes,
+    sha256, spin_up_with_gateway,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -16,18 +16,14 @@ use tokio::net::TcpStream;
 // ---------- OPTIONS preflight ----------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn gateway_options_returns_204_with_cors_headers() {
+async fn gateway_options_returns_204() {
+    // Series C dropped `Access-Control-Allow-Origin: *` (internal-only
+    // deployment). The OPTIONS path remains so browser preflights don't
+    // hard-error; we just no longer advertise CORS.
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let resp = http_options(gw.addr, "/file/push").await.unwrap();
     assert_eq!(resp.status, 204);
-    assert_eq!(resp.header("Access-Control-Allow-Origin"), Some("*"));
-    let methods = resp.header("Access-Control-Allow-Methods").unwrap_or_default();
-    assert!(methods.contains("POST"));
-    assert!(methods.contains("GET"));
-    assert!(methods.contains("OPTIONS"));
-    let allow_headers = resp.header("Access-Control-Allow-Headers").unwrap_or_default();
-    assert!(allow_headers.contains("Content-Type"));
-    assert!(allow_headers.contains("X-Filename"));
+    assert!(resp.header("Access-Control-Allow-Origin").is_none());
     teardown(ring, gw).await;
 }
 
@@ -205,19 +201,17 @@ async fn gateway_post_network_heal_returns_ok_message() {
     teardown(ring, gw).await;
 }
 
-// ---------- POST /node/<port>/kill ----------
+// ---------- POST /node/<port>/kill (removed) ----------
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn gateway_post_kill_unknown_port_returns_500() {
-    // Kills via lsof on a port that no process is listening on.
+async fn gateway_post_kill_endpoint_removed_returns_404() {
+    // Series C removed `POST /node/<port>/kill` entirely — it was a remote
+    // RCE primitive and operators don't need it (SSH + pkill exists).
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let resp = http_post(gw.addr, "/node/65535/kill", &[], &[])
         .await
         .unwrap();
-    assert_eq!(resp.status, 500);
-    let body = resp.body_str();
-    assert!(body.contains("65535"), "body should mention port: {body}");
+    assert_eq!(resp.status, 404);
     teardown(ring, gw).await;
 }
 
@@ -375,7 +369,4 @@ async fn gateway_tcp_proxy_passes_through_file_push_pull() {
 
 // ---------- helper ----------
 
-async fn teardown(ring: common::Ring, gw: GatewayHandle) {
-    gw.task.abort();
-    shutdown(ring).await;
-}
+use common::teardown;

@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use tracing;
 
 use crate::{
+    auth::AuthToken,
     node::{self, FsyncMode, Node, append_edge, port_str},
     protocol::{self, validate_filename},
 };
@@ -33,6 +34,7 @@ pub async fn bind(
     storage_root: PathBuf,
     respawn_dead: bool,
     fsync_mode: FsyncMode,
+    auth_token: AuthToken,
 ) -> Result<(Arc<Node>, TcpListener, std::net::SocketAddr), AnyErr> {
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
@@ -57,6 +59,7 @@ pub async fn bind(
         storage_root,
         respawn_dead,
         fsync_mode,
+        auth_token,
     );
     tracing::info!(node = %node.port, "Node listening");
 
@@ -144,6 +147,7 @@ pub async fn run(
     gossip_interval: Duration,
     file_size: u64,
     fsync_mode: FsyncMode,
+    auth_token: AuthToken,
 ) -> Result<(), AnyErr> {
     let (node, listener, _addr) = bind(
         bind_addr,
@@ -152,6 +156,7 @@ pub async fn run(
         PathBuf::from("nodes"),
         true,
         fsync_mode,
+        auth_token,
     )
     .await?;
     serve(node, listener).await;
@@ -162,6 +167,37 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
     // Set read and write streams
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+
+    // AUTH handshake (skipped if the node's token is disabled).
+    //
+    // First line on every accepted connection must be:
+    //   AUTH <hmac_hex> <nonce_hex>
+    //
+    // Bounded by a 1s timeout so an attacker who opens a TCP connection
+    // and sends nothing can't hold a tokio task forever. Failed auth gets
+    // an explicit ERR line before close so a misconfigured operator can
+    // diagnose it without packet captures.
+    if node.auth_token.is_enabled() {
+        let mut auth_line = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            reader.read_line(&mut auth_line),
+        )
+        .await;
+        let n = match read {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                let _ = writer.write_all(b"ERR auth timeout\n").await;
+                return Ok(());
+            }
+        };
+        if n == 0 || !node.auth_token.verify_auth_line(&auth_line) {
+            let _ = writer.write_all(b"ERR auth required\n").await;
+            tracing::warn!(node = %node.port, "Rejected unauthenticated connection");
+            return Ok(());
+        }
+    }
 
     // The protocol is line delimited, so we just need to read the first line
     // when figuring out how to handle the request
@@ -420,6 +456,7 @@ async fn check_and_heal_neighbor(
     if port_str(&next_addr) == port_str(start_addr) {
         tracing::info!(node = %node.port, token = %token, "Heal walk: Completed ring, sending DONE.");
         let mut s = TcpStream::connect(start_addr).await?;
+        send_auth(&mut s, &node.auth_token).await?;
         s.write_all(format!("NODE HEAL-DONE {}\n", token).as_bytes())
             .await?;
         return Ok(());
@@ -431,6 +468,7 @@ async fn check_and_heal_neighbor(
             // 3. Node is ALIVE -> Forward the HEAL-HOP request
             tracing::debug!(node = %node.port, target = %next_addr, "Heal walk: Node is alive, forwarding hop.");
             let mut s = TcpStream::connect(&next_addr).await?;
+            send_auth(&mut s, &node.auth_token).await?;
             s.write_all(format!("NODE HEAL-HOP {} {}\n", token, start_addr).as_bytes())
                 .await?;
         }
@@ -461,6 +499,7 @@ async fn check_and_heal_neighbor(
                 "Heal walk: Node healed, forwarding hop."
             );
             let mut s = TcpStream::connect(&next_addr).await?;
+            send_auth(&mut s, &node.auth_token).await?;
             s.write_all(format!("NODE HEAL-HOP {} {}\n", token, start_addr).as_bytes())
                 .await?;
         }
@@ -938,7 +977,12 @@ where
     // and drains. Future work could fall back to a relay; not in scope.
     let connect_futures = target_addrs.iter().map(|addr| {
         let addr = addr.clone();
-        async move { TcpStream::connect(&addr).await.map(|s| (addr, s)) }
+        let token = node.auth_token.clone();
+        async move {
+            let mut s = TcpStream::connect(&addr).await?;
+            send_auth(&mut s, &token).await?;
+            Ok::<(String, TcpStream), AnyErr>((addr, s))
+        }
     });
     let mut conns: Vec<(String, TcpStream)> = match futures::future::try_join_all(connect_futures).await {
         Ok(v) => v,
@@ -1335,12 +1379,13 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
         .into_iter()
         .map(|(i, chunk_name, owner_addr, owner_port)| {
             let sem = Arc::clone(&sem);
+            let token = node.auth_token.clone();
             async move {
                 // Acquire-on-spawn would defeat ordered pipelining; acquire
                 // inside the task so FuturesOrdered can buffer up to CAP
                 // pending tasks while the writer drains in order.
                 let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                let r = request_chunk_from(&owner_addr, &chunk_name).await;
+                let r = request_chunk_from(&owner_addr, &chunk_name, &token).await;
                 (i, chunk_name, owner_addr, owner_port, r)
             }
         })
@@ -1385,7 +1430,7 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
                     continue;
                 };
                 let pred_addr = format!("{}:{}", host, pred_port);
-                match request_backup_chunk_from(&pred_addr, &chunk_name).await {
+                match request_backup_chunk_from(&pred_addr, &chunk_name, &node.auth_token).await {
                     Ok((chunk_data, _)) => {
                         tracing::info!(
                             node = %node.port,
@@ -1436,8 +1481,13 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn request_chunk_from(addr: &str, chunk_name: &str) -> Result<(Vec<u8>, String), AnyErr> {
+async fn request_chunk_from(
+    addr: &str,
+    chunk_name: &str,
+    token: &AuthToken,
+) -> Result<(Vec<u8>, String), AnyErr> {
     let mut s = TcpStream::connect(addr).await?;
+    send_auth(&mut s, token).await?;
     s.write_all(format!("FILE GET-CHUNK {}\n", chunk_name).as_bytes())
         .await?;
 
@@ -1472,8 +1522,10 @@ async fn request_chunk_from(addr: &str, chunk_name: &str) -> Result<(Vec<u8>, St
 async fn request_backup_chunk_from(
     addr: &str,
     chunk_name: &str,
+    token: &AuthToken,
 ) -> Result<(Vec<u8>, String), AnyErr> {
     let mut s = TcpStream::connect(addr).await?;
+    send_auth(&mut s, token).await?;
     // Send the new command
     s.write_all(format!("FILE GET-BACKUP-CHUNK {}\n", chunk_name).as_bytes())
         .await?;
@@ -1530,6 +1582,20 @@ async fn handle_file_list_csv<W: AsyncWrite + Unpin>(
 }
 
 // --- Helpers
+
+/// Write the AUTH handshake line on a freshly-opened outbound stream.
+/// No-op when the token is disabled. Callers must invoke this BEFORE the
+/// first protocol command on every internal connection (gossip, fan-out,
+/// pull, backup-push, heal share, gateway → ring).
+async fn send_auth<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    token: &AuthToken,
+) -> Result<(), AnyErr> {
+    if let Some(line) = token.make_auth_line() {
+        writer.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
 
 async fn handle_error<W: AsyncWrite + Unpin>(writer: &mut W, err: String) -> Result<(), AnyErr> {
     writer
@@ -1626,6 +1692,10 @@ async fn push_to_predecessor(node: Arc<Node>, chunk_name: String) {
             return;
         }
     };
+    if let Err(e) = send_auth(&mut s, &node.auth_token).await {
+        tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Failed to send AUTH on backup push.");
+        return;
+    }
 
     let header = format!("FILE BACKUP-PUSH {} {}\n", chunk_name, size);
     if let Err(e) = s.write_all(header.as_bytes()).await {
@@ -1694,11 +1764,12 @@ async fn spawn_gossip_loop(node: Arc<Node>) {
 }
 
 /// Tries to send "NODE PING" and expects "PONG"
-async fn check_node_health(_node: Arc<Node>, addr: &str) -> Result<(), AnyErr> {
+async fn check_node_health(node: Arc<Node>, addr: &str) -> Result<(), AnyErr> {
     let timeout = Duration::from_secs(2);
 
     // Connect with timeout
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr)).await??;
+    send_auth(&mut stream, &node.auth_token).await?;
     stream.write_all(b"NODE PING\n").await?;
 
     // Read response with timeout
@@ -1758,6 +1829,25 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
         .arg("--wait-time")
         .arg(node.gossip_interval.as_millis().to_string());
 
+    // env_clear: don't leak our environment to the respawned child. Pass
+    // through only what the child genuinely needs:
+    //   - PATH so it can run its own subprocesses
+    //   - RUST_LOG so log levels match the rest of the cluster
+    //   - OUROBOROS_AUTH_TOKEN so the new node can rejoin the ring
+    //
+    // Anything else (terminal vars, agent sockets, secrets unrelated to
+    // ouroboros) stays in this process. (NEXT_STEPS.md §2.7.)
+    cmd.env_clear();
+    if let Ok(v) = env::var("PATH") {
+        cmd.env("PATH", v);
+    }
+    if let Ok(v) = env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", v);
+    }
+    if let Some(bearer) = node.auth_token.bearer_value() {
+        cmd.env("OUROBOROS_AUTH_TOKEN", bearer);
+    }
+
     // Spawn the child and detach it
     let _ = cmd.spawn()?;
 
@@ -1804,6 +1894,7 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
     // Share NETMAP
     let entries = node.get_network_nodes_entries().await;
     let mut s_netmap = tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+    send_auth(&mut s_netmap, &node.auth_token).await?;
     s_netmap
         .write_all(format!("NETMAP SET {}\n", entries).as_bytes())
         .await?;
@@ -1813,6 +1904,7 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
     let history = node.get_topology_history().await;
     if !history.is_empty() {
         let mut s_topo = tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+        send_auth(&mut s_topo, &node.auth_token).await?;
         s_topo
             .write_all(format!("TOPOLOGY SET {}\n", history).as_bytes())
             .await?;
@@ -1823,6 +1915,7 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
     let tags_entries = node.get_file_tags_entries().await;
     if !tags_entries.is_empty() {
         let mut s_tags = tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+        send_auth(&mut s_tags, &node.auth_token).await?;
         s_tags
             .write_all(format!("FILE TAGS-SET {}\n", tags_entries).as_bytes())
             .await?;
@@ -1836,6 +1929,7 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
         let host = host_of(&node.port);
         let next_addr = format!("{}:{}", host, port);
         let mut s_next = tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+        send_auth(&mut s_next, &node.auth_token).await?;
         s_next
             .write_all(format!("NODE NEXT {}\n", next_addr).as_bytes())
             .await?;

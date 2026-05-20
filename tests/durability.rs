@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::{RingOpts, pull_bytes, push_bytes, sha256, shutdown, spin_up};
-use ouroboros_fs::{FsyncMode, bind, serve};
+use ouroboros_fs::{AuthToken, FsyncMode, bind, serve};
 use tempfile::TempDir;
 
 /// Round-trip with `FsyncMode::Full`. We can't actually verify fsync was
@@ -85,6 +85,7 @@ async fn bind_sweeps_orphan_partials() {
         storage.clone(),
         false,
         FsyncMode::None,
+        AuthToken::disabled(),
     )
     .await
     .unwrap();
@@ -115,6 +116,7 @@ async fn bind_sweeps_orphan_partials() {
         storage.clone(),
         false,
         FsyncMode::None,
+        AuthToken::disabled(),
     )
     .await
     .unwrap();

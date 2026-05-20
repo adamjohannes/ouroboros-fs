@@ -1,4 +1,5 @@
 use crate::NodeStatus;
+use crate::auth::AuthToken;
 use crate::node::port_str;
 use serde::Serialize;
 use serde_json;
@@ -10,7 +11,6 @@ use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 /// Reject Content-Length above this ceiling before opening a ring connection.
@@ -26,6 +26,11 @@ const OVERSIZED_ERR_TAG: &str = "oversized:";
 pub struct Gateway {
     /// Full addresses
     node_addrs: Vec<String>,
+    /// Bearer token for HTTP clients AND PSK for ring outbound. The gateway
+    /// is the bridge: HTTP clients authenticate to it via `Authorization:
+    /// Bearer <hex>`, and the gateway uses the same secret to AUTH onto
+    /// every ring node. (See `auth::AuthToken`.)
+    auth_token: AuthToken,
 }
 
 /// HTTP Response Struct
@@ -38,7 +43,17 @@ struct FileInfo {
 
 impl Gateway {
     pub fn new(node_addrs: Vec<String>) -> Arc<Self> {
-        Arc::new(Self { node_addrs })
+        Arc::new(Self {
+            node_addrs,
+            auth_token: AuthToken::disabled(),
+        })
+    }
+
+    pub fn with_auth(node_addrs: Vec<String>, auth_token: AuthToken) -> Arc<Self> {
+        Arc::new(Self {
+            node_addrs,
+            auth_token,
+        })
     }
 
     /// Runs the main TCP server to listen for clients
@@ -103,8 +118,30 @@ impl Gateway {
         R: AsyncRead + Unpin,
     {
         let parts: Vec<&str> = first_line.split_whitespace().collect();
-        let method = parts.get(0).cloned().unwrap_or("GET");
+        let method = parts.first().cloned().unwrap_or("GET");
         let path = parts.get(1).cloned().unwrap_or("/");
+
+        // Drain HTTP headers up front. Auth (and CORS preflight) decisions
+        // happen here, before any handler-specific code runs. The body (if
+        // any) is whatever is left in `reader` after the empty line.
+        let headers = match Self::read_http_headers(reader).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = ?e, "Gateway: malformed HTTP headers");
+                return Self::send_error_response(writer, 400, "Bad Request: malformed headers")
+                    .await;
+            }
+        };
+
+        // OPTIONS requests do NOT require auth (browsers send them as
+        // preflight without credentials by design). All other methods do.
+        if method != "OPTIONS"
+            && !self
+                .auth_token
+                .verify_bearer(headers.get("authorization").map(String::as_str))
+        {
+            return Self::send_error_response(writer, 401, "Unauthorized").await;
+        }
 
         // Handle GET /file/pull/<filename>
         if method == "GET" && path.starts_with("/file/pull/") {
@@ -131,7 +168,7 @@ impl Gateway {
                 Ok(list) => Self::send_json_response(writer, &list).await,
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
-            ("POST", "/file/push") => match self.handle_file_upload(reader).await {
+            ("POST", "/file/push") => match self.handle_file_upload(reader, &headers).await {
                 Ok(_) => {
                     Self::send_json_response(writer, serde_json::json!({"status": "ok"})).await
                 }
@@ -151,70 +188,72 @@ impl Gateway {
                 }
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
-
-            (method, path)
-                if method == "POST" && path.starts_with("/node/") && path.ends_with("/kill") =>
-            {
-                // Handle POST /node/<port>/kill
-                if let Some(port_str) = path
-                    .strip_prefix("/node/")
-                    .and_then(|p| p.strip_suffix("/kill"))
-                {
-                    match self.trigger_node_kill(port_str).await {
-                        Ok(msg) => {
-                            Self::send_json_response(writer, serde_json::json!({ "message": msg }))
-                                .await
-                        }
-                        Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
-                    }
-                } else {
-                    Self::send_error_response(writer, 400, "Bad Request: Malformed kill URL").await
-                }
-            }
+            // The kill endpoint was removed in Series C: it was a remote
+            // RCE primitive (it ran `kill` on a PID derived from `lsof`)
+            // that operators don't need (SSH + pkill exists). Return 404.
             _ => Self::send_error_response(writer, 404, "Not Found").await,
         }
     }
 
-    /// Handles the `POST /api/upload` request
+    /// Read HTTP request headers up to (and consuming) the terminating empty
+    /// line. Returns lowercased keys → trimmed values. The reader is left
+    /// positioned at the first byte of the body (if any).
+    async fn read_http_headers<R>(
+        reader: &mut BufReader<R>,
+    ) -> io::Result<HashMap<String, String>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        const MAX_HEADERS: usize = 64;
+        const MAX_LINE_LEN: usize = 8 * 1024;
+        let mut headers = HashMap::new();
+        let mut line = String::new();
+        for _ in 0..MAX_HEADERS {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            if n > MAX_LINE_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "header line too long",
+                ));
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                return Ok(headers);
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "too many or unterminated headers",
+        ))
+    }
+
+    /// Handles the `POST /file/push` request. Headers have been pre-parsed
+    /// by `handle_http_request`; the reader is positioned at the body.
     async fn handle_file_upload<R>(
         self: Arc<Self>,
         reader: &mut BufReader<R>,
+        headers: &HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         R: AsyncRead + Unpin,
     {
-        // 1. Read headers to find Content-Length and X-Filename
-        let mut content_length: u64 = 0;
-        let mut filename: Option<String> = None;
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).await? == 0 {
-                break; // Premature end
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                break; // End of headers
-            }
-
-            if let Some((key, value)) = trimmed.split_once(':') {
-                let key_lower = key.to_ascii_lowercase();
-                let value_trimmed = value.trim();
-
-                if key_lower == "content-length" {
-                    content_length = value_trimmed.parse().unwrap_or(0);
-                }
-                if key_lower == "x-filename" {
-                    // Sanitize filename
-                    let safe_name = value_trimmed.replace(
-                        |c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-',
-                        "_",
-                    );
-                    filename = Some(safe_name);
-                }
-            }
-        }
+        let content_length: u64 = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let filename = headers.get("x-filename").map(|raw| {
+            raw.replace(
+                |c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-',
+                "_",
+            )
+        });
 
         if content_length == 0 || filename.is_none() {
             return Err("Missing Content-Length or X-Filename header".into());
@@ -342,7 +381,7 @@ impl Gateway {
     /// Sends a "NODE PING" to a single address and returns its status.
     ///
     /// This is a lightweight, best-effort check with a short timeout.
-    async fn ping_node(addr: String) -> (String, NodeStatus) {
+    async fn ping_node(addr: String, token: AuthToken) -> (String, NodeStatus) {
         let port = port_str(&addr).to_string();
         let timeout = Duration::from_millis(500);
 
@@ -351,6 +390,11 @@ impl Gateway {
         let check = async {
             // Connect with timeout
             let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr)).await??;
+
+            // Authenticate before any protocol command (no-op when disabled).
+            if let Some(line) = token.make_auth_line() {
+                stream.write_all(line.as_bytes()).await?;
+            }
 
             // Send the PING command
             stream.write_all(b"NODE PING\n").await?;
@@ -383,7 +427,8 @@ impl Gateway {
 
         // 1. Spawn a concurrent ping task for every node address we know
         for addr in self.node_addrs.clone() {
-            tasks.push(tokio::spawn(Self::ping_node(addr)));
+            let token = self.auth_token.clone();
+            tasks.push(tokio::spawn(Self::ping_node(addr, token)));
         }
 
         let mut map = HashMap::new();
@@ -461,71 +506,19 @@ impl Gateway {
         }
     }
 
-    /// Finds a process by port and kills it. (Unix-specific)
-    async fn trigger_node_kill(
-        &self,
-        port: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!(port = %port, "Gateway: Received request to kill node");
-
-        // 1. Find PID using lsof
-        let lsof_output = Command::new("lsof")
-            .arg(format!("-iTCP:{}", port))
-            .arg("-sTCP:LISTEN")
-            .arg("-n")
-            .arg("-P")
-            .arg("-t")
-            .output()
-            .await?;
-
-        if !lsof_output.status.success() {
-            tracing::warn!(port = %port, error = ?String::from_utf8_lossy(&lsof_output.stderr), "lsof command failed");
-            return Err(format!(
-                "lsof failed to find port {}: {}",
-                port,
-                String::from_utf8_lossy(&lsof_output.stderr)
-            )
-            .into());
-        }
-
-        let pid_str = String::from_utf8(lsof_output.stdout)?.trim().to_string();
-        if pid_str.is_empty() {
-            tracing::warn!(port = %port, "No process found listening on port");
-            return Err(format!("No process found on port {}", port).into());
-        }
-
-        // lsof might return multiple PIDs, just use the first line
-        let pid = pid_str.lines().next().unwrap_or("").trim();
-        if pid.is_empty() {
-            return Err(format!("No PID found on port {}", port).into());
-        }
-
-        // 2. Kill the PID
-        let kill_output = Command::new("kill")
-            .arg(pid) // Send SIGTERM
-            .output()
-            .await?;
-
-        if !kill_output.status.success() {
-            tracing::error!(port = %port, pid = %pid, error = ?String::from_utf8_lossy(&kill_output.stderr), "kill command failed");
-            return Err(format!(
-                "kill failed for PID {}: {}",
-                pid,
-                String::from_utf8_lossy(&kill_output.stderr)
-            )
-            .into());
-        }
-
-        tracing::info!(port = %port, pid = %pid, "Successfully sent kill signal to node");
-        Ok(format!("Killed node on port {} (PID: {})", port, pid))
-    }
-
     // --- TCP Helpers
 
-    /// Tries all node addresses and returns a stream to the first one that connects.
+    /// Tries all node addresses and returns a stream to the first one that
+    /// connects, having already sent the wire-protocol AUTH line on it.
     async fn connect_to_ring(&self) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
         for addr in &self.node_addrs {
-            if let Ok(stream) = TcpStream::connect(addr).await {
+            if let Ok(mut stream) = TcpStream::connect(addr).await {
+                if let Some(line) = self.auth_token.make_auth_line() {
+                    if let Err(e) = stream.write_all(line.as_bytes()).await {
+                        tracing::warn!(node = %addr, error = ?e, "Gateway: failed to send AUTH; trying next node");
+                        continue;
+                    }
+                }
                 return Ok(stream);
             }
         }
@@ -533,13 +526,16 @@ impl Gateway {
     }
 
     // --- HTTP Helpers
+    //
+    // For an internal-only deployment we DO NOT emit
+    // `Access-Control-Allow-Origin: *`. Browsers should refuse cross-origin
+    // reads of the gateway. If a future dashboard needs CORS, it can be
+    // re-added with a specific allowed origin (not wildcard).
 
     /// Sends a 204 No Content response for OPTIONS preflight requests
     async fn send_options_response(writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         let response = "HTTP/1.1 204 No Content\r\n\
-                        Access-Control-Allow-Origin: *\r\n\
-                        Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n\
-                        Access-Control-Allow-Headers: Content-Type, X-Filename\r\n\
+                        Allow: POST, GET, OPTIONS\r\n\
                         Connection: close\r\n\
                         \r\n";
         writer.write_all(response.as_bytes()).await
@@ -553,7 +549,6 @@ impl Gateway {
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: application/octet-stream\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              Content-Disposition: attachment; filename=\"{}\"\r\n\
              Connection: close\r\n\
              \r\n",
@@ -570,7 +565,6 @@ impl Gateway {
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: application/json\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n\
@@ -589,7 +583,6 @@ impl Gateway {
         let response = format!(
             "HTTP/1.1 {} {}\r\n\
              Content-Type: text/plain\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n\

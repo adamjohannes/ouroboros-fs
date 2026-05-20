@@ -1,4 +1,5 @@
 use crate::NodeStatus;
+use crate::auth::AuthToken;
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -107,6 +108,10 @@ pub struct Node {
     /// fsync policy for chunk writes; see [`FsyncMode`].
     pub fsync_mode: FsyncMode,
 
+    /// Pre-shared-key authentication for inbound and outbound TCP. When
+    /// disabled (test default), the AUTH handshake is skipped entirely.
+    pub auth_token: AuthToken,
+
     /// Counts how many times this node has called `broadcast_netmap_update`.
     /// Useful for tests that want to assert "exactly one broadcast per dead
     /// host"; also provides a cheap debug signal in production.
@@ -121,6 +126,7 @@ impl Node {
         storage_root: PathBuf,
         respawn_dead: bool,
         fsync_mode: FsyncMode,
+        auth_token: AuthToken,
     ) -> Arc<Self> {
         let network_nodes = RwLock::new(HashMap::new());
 
@@ -138,6 +144,7 @@ impl Node {
             storage_root,
             respawn_dead: AtomicBool::new(respawn_dead),
             fsync_mode,
+            auth_token,
             netmap_broadcasts: AtomicU64::new(0),
         })
     }
@@ -150,6 +157,20 @@ impl Node {
         self.next_port.read().await.clone()
     }
 
+    /// Send the wire-protocol AUTH line on a freshly-opened outbound stream.
+    /// No-op when the token is disabled. Mirrors `server::send_auth` so the
+    /// node's own `forward_*` and broadcast methods can authenticate without
+    /// pulling a server-only helper in here.
+    async fn write_auth<W>(&self, w: &mut W) -> std::io::Result<()>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        if let Some(line) = self.auth_token.make_auth_line() {
+            w.write_all(line.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn forward_ring_forward(
         &self,
         ttl: u32,
@@ -157,6 +178,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
+            self.write_auth(&mut s).await?;
             let line = format!("RING FORWARD {} {}\n", ttl, msg);
             s.write_all(line.as_bytes()).await?;
         }
@@ -255,6 +277,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
+            self.write_auth(&mut s).await?;
             let line = format!("TOPOLOGY HOP {} {} {}\n", token, start_addr, history);
             s.write_all(line.as_bytes()).await?;
         }
@@ -286,6 +309,7 @@ impl Node {
         history: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
+        self.write_auth(&mut s).await?;
         let line = format!("TOPOLOGY DONE {} {}\n", token, history);
         s.write_all(line.as_bytes()).await?;
         Ok(())
@@ -412,6 +436,7 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
+            self.write_auth(&mut s).await?;
             let line = format!("NETMAP HOP {} {} {}\n", token, start_addr, entries);
             s.write_all(line.as_bytes()).await?;
         }
@@ -425,6 +450,7 @@ impl Node {
         entries: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
+        self.write_auth(&mut s).await?;
         let line = format!("NETMAP DONE {} {}\n", token, entries);
         s.write_all(line.as_bytes()).await?;
         Ok(())
@@ -439,6 +465,7 @@ impl Node {
                 continue;
             } // Don't broadcast to self
             if let Ok(mut s) = TcpStream::connect(&addr).await {
+                let _ = self.write_auth(&mut s).await;
                 let line = format!("NETMAP SET {}\n", entries);
                 let _ = s.write_all(line.as_bytes()).await;
             }
@@ -503,6 +530,7 @@ impl Node {
                 continue;
             }
             if let Ok(mut s) = TcpStream::connect(&addr).await {
+                let _ = self.write_auth(&mut s).await;
                 let line = format!("TOPOLOGY SET {}\n", history);
                 let _ = s.write_all(line.as_bytes()).await;
             }
@@ -518,6 +546,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::{FsyncMode, Node, append_edge, host_str, parse_entries, port_str, serialize_entries};
+    use crate::auth::AuthToken;
     use crate::NodeStatus;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -535,6 +564,7 @@ mod tests {
             PathBuf::from("/tmp/ouroboros_unit_unused"),
             false,
             FsyncMode::None,
+            AuthToken::disabled(),
         )
     }
 

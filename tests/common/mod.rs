@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ouroboros_fs::{FsyncMode, Node, bind, serve};
+use ouroboros_fs::{AuthToken, FsyncMode, Node, bind, serve};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_chacha::ChaCha20Rng;
@@ -49,6 +49,7 @@ pub struct RingOpts {
     pub gossip_interval: Duration,
     pub max_file_size: u64,
     pub fsync_mode: FsyncMode,
+    pub auth_token: AuthToken,
 }
 
 impl Default for RingOpts {
@@ -60,6 +61,8 @@ impl Default for RingOpts {
             max_file_size: 1 << 30,
             // Tests opt out of fsync for speed; the fsync_full test opts in.
             fsync_mode: FsyncMode::None,
+            // Tests opt out of wire auth; auth-specific tests opt in.
+            auth_token: AuthToken::disabled(),
         }
     }
 }
@@ -84,6 +87,7 @@ pub async fn spin_up(opts: RingOpts) -> Ring {
             storage,
             /*respawn_dead=*/ false,
             opts.fsync_mode,
+            opts.auth_token.clone(),
         )
         .await
         .expect("bind");
@@ -110,18 +114,18 @@ pub async fn spin_up(opts: RingOpts) -> Ring {
         for i in 0..opts.n {
             let from = nodes[i].addr;
             let to = nodes[(i + 1) % opts.n].addr;
-            send_node_next(from, to).await.expect("NODE NEXT");
+            send_node_next(from, to, &opts.auth_token).await.expect("NODE NEXT");
         }
     } else {
         // Single-node ring still needs a next hop; point it at itself.
-        send_node_next(nodes[0].addr, nodes[0].addr)
+        send_node_next(nodes[0].addr, nodes[0].addr, &opts.auth_token)
             .await
             .expect("NODE NEXT (self)");
     }
 
     // 4. Trigger NETMAP DISCOVER from node 0; poll every node's network_size
     //    until it reflects the full ring (or a deadline elapses).
-    fire_and_forget(nodes[0].addr, b"NETMAP DISCOVER\n")
+    fire_and_forget(nodes[0].addr, b"NETMAP DISCOVER\n", &opts.auth_token)
         .await
         .expect("NETMAP DISCOVER");
     poll_until(Duration::from_secs(3), || async {
@@ -136,7 +140,7 @@ pub async fn spin_up(opts: RingOpts) -> Ring {
     .expect("netmap converged");
 
     // 5. Trigger TOPOLOGY WALK; poll topology_map until it has every edge.
-    fire_and_forget(nodes[0].addr, b"TOPOLOGY WALK\n")
+    fire_and_forget(nodes[0].addr, b"TOPOLOGY WALK\n", &opts.auth_token)
         .await
         .expect("TOPOLOGY WALK");
     poll_until(Duration::from_secs(3), || async {
@@ -245,8 +249,15 @@ fn _stdrng_marker() -> StdRng {
 
 // ---------- internal ----------
 
-async fn send_node_next(from: SocketAddr, to: SocketAddr) -> std::io::Result<()> {
+async fn send_node_next(
+    from: SocketAddr,
+    to: SocketAddr,
+    token: &AuthToken,
+) -> std::io::Result<()> {
     let mut s = TcpStream::connect(from).await?;
+    if let Some(line) = token.make_auth_line() {
+        s.write_all(line.as_bytes()).await?;
+    }
     let line = format!("NODE NEXT {to}\n");
     s.write_all(line.as_bytes()).await?;
     let mut reader = BufReader::new(s);
@@ -259,8 +270,15 @@ async fn send_node_next(from: SocketAddr, to: SocketAddr) -> std::io::Result<()>
     Ok(())
 }
 
-async fn fire_and_forget(addr: SocketAddr, line: &[u8]) -> std::io::Result<()> {
+async fn fire_and_forget(
+    addr: SocketAddr,
+    line: &[u8],
+    token: &AuthToken,
+) -> std::io::Result<()> {
     let mut s = TcpStream::connect(addr).await?;
+    if let Some(auth) = token.make_auth_line() {
+        s.write_all(auth.as_bytes()).await?;
+    }
     s.write_all(line).await?;
     let _ = tokio::time::timeout(Duration::from_millis(100), async {
         let mut tmp = [0u8; 64];
@@ -303,13 +321,14 @@ pub struct GatewayHandle {
 pub async fn spin_up_with_gateway(opts: RingOpts) -> (Ring, GatewayHandle) {
     use tokio::net::TcpListener;
 
+    let token = opts.auth_token.clone();
     let ring = spin_up(opts).await;
 
     let node_addrs: Vec<String> = ring.nodes.iter().map(|h| h.addr.to_string()).collect();
     let gw_listener = TcpListener::bind("127.0.0.1:0").await.expect("gw bind");
     let gw_addr = gw_listener.local_addr().expect("gw addr");
     drop(gw_listener);
-    let gw = ouroboros_fs::Gateway::new(node_addrs);
+    let gw = ouroboros_fs::Gateway::with_auth(node_addrs, token);
     let listen = gw_addr.to_string();
     let task = tokio::spawn(async move {
         let _ = gw.run_server(listen).await;
@@ -332,6 +351,13 @@ pub async fn spin_up_with_gateway(opts: RingOpts) -> (Ring, GatewayHandle) {
     }
 
     (ring, GatewayHandle { addr: gw_addr, task })
+}
+
+/// Teardown for ring + gateway pairs. Aborts the gateway accept task,
+/// drops the ring (which aborts every node task and removes the tempdir).
+pub async fn teardown(ring: Ring, gw: GatewayHandle) {
+    gw.task.abort();
+    shutdown(ring).await;
 }
 
 // ---------- Minimal HTTP client ----------
@@ -462,6 +488,28 @@ pub async fn http_post(
 
 pub async fn http_options(addr: SocketAddr, path: &str) -> std::io::Result<HttpResponse> {
     http_request(addr, "OPTIONS", path, &[], &[]).await
+}
+
+/// Send a fully pre-formatted HTTP request and parse the response. Used by
+/// auth tests that need precise control over headers (e.g. omitted
+/// Authorization, mixed casing).
+pub async fn raw_http(addr: SocketAddr, raw_request: &[u8]) -> std::io::Result<HttpResponse> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut s = loop {
+        match TcpStream::connect(addr).await {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    s.write_all(raw_request).await?;
+    s.shutdown().await.ok();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await?;
+    parse_http_response(&raw)
 }
 
 // ---------- Subprocess "ring of real binaries" for heal coverage ----------

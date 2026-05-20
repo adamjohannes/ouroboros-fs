@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use libc;
-use ouroboros_fs::{FsyncMode, run};
+use ouroboros_fs::{AuthToken, FsyncMode, run};
 use std::{env, error::Error, fs, path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -56,6 +56,12 @@ enum Cmd {
         /// (file fsync + parent-dir fsync per chunk).
         #[arg(long, value_enum, default_value_t = CliFsyncMode::Full)]
         fsync_mode: CliFsyncMode,
+        /// Pre-shared key (64 hex chars / 32 bytes) for the wire-protocol
+        /// AUTH handshake. Falls back to the OUROBOROS_AUTH_TOKEN env var.
+        /// If neither is set, auth is DISABLED — only acceptable for
+        /// single-host development.
+        #[arg(long)]
+        auth_token: Option<String>,
     },
 
     /// Spawn N nodes and stitch them into a ring
@@ -107,10 +113,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             wait_time,
             file_size,
             fsync_mode,
+            auth_token,
         } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
-            run(&bind, gossip_interval, file_size, fsync_mode.into()).await
+            let token = resolve_auth_token(auth_token)?;
+            run(&bind, gossip_interval, file_size, fsync_mode.into(), token).await
         }
         Cmd::SetNetwork {
             nodes,
@@ -165,6 +173,26 @@ fn normalize_addr(raw: String) -> String {
         raw
     } else {
         format!("127.0.0.1:{raw}")
+    }
+}
+
+/// Resolve the auth token: --auth-token > $OUROBOROS_AUTH_TOKEN > disabled.
+/// Disabled auth is documented as development-only; we log a warning so it
+/// shows up in production deployments by accident-detection.
+fn resolve_auth_token(
+    flag: Option<String>,
+) -> Result<AuthToken, Box<dyn Error + Send + Sync>> {
+    let raw = flag.or_else(|| env::var("OUROBOROS_AUTH_TOKEN").ok());
+    match raw {
+        Some(hex) => Ok(AuthToken::from_hex(&hex)?),
+        None => {
+            tracing::warn!(
+                "No auth token configured (--auth-token / OUROBOROS_AUTH_TOKEN). \
+                 Wire-protocol AUTH handshake is DISABLED. Only acceptable for \
+                 single-host development."
+            );
+            Ok(AuthToken::disabled())
+        }
     }
 }
 
