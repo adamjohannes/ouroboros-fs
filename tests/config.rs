@@ -132,7 +132,10 @@ fsync_mode = "none"
     let _ = child.kill();
     let _ = child.wait();
 
-    assert!(bound_cli, "CLI --addr should have won; child not on {cli_port}");
+    assert!(
+        bound_cli,
+        "CLI --addr should have won; child not on {cli_port}"
+    );
     assert!(
         !cfg_bound,
         "config addr {cfg_port} should NOT be bound when CLI overrides"

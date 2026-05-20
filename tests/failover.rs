@@ -53,7 +53,9 @@ async fn adjacent_double_failure_emits_truncation_signal() {
     .await;
 
     let bytes = rand_bytes(101, 256 * 1024);
-    push_bytes(ring.addr(0), "doomed.bin", &bytes).await.unwrap();
+    push_bytes(ring.addr(0), "doomed.bin", &bytes)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Kill chunk owner (2) and its predecessor (1) which holds chunk 2's
@@ -165,7 +167,9 @@ async fn backup_present_after_push() {
     .await;
 
     let bytes = rand_bytes(/*seed=*/ 300, 4 * 4096); // 16 KiB, 4 chunks of 4 KiB
-    push_bytes(ring.addr(0), "backed.bin", &bytes).await.unwrap();
+    push_bytes(ring.addr(0), "backed.bin", &bytes)
+        .await
+        .unwrap();
 
     // Allow PR6's spawned push_to_predecessor tasks to complete.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -191,12 +195,8 @@ async fn backup_present_after_push() {
             .join("backup")
             .join(&chunk_name);
 
-        let raw = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "backup missing on node {i} at {}: {e}",
-                path.display()
-            )
-        });
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("backup missing on node {i} at {}: {e}", path.display()));
         // Series B trailer: the on-disk chunk is `body || sha256(body)`.
         // Strip the 32-byte trailer before hashing the body for comparison.
         assert!(

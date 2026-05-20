@@ -45,7 +45,9 @@ impl AuthToken {
     }
 
     pub fn from_bytes(secret: [u8; 32]) -> Self {
-        Self { secret: Some(secret) }
+        Self {
+            secret: Some(secret),
+        }
     }
 
     /// Parse a 64-character hex string into a token.
@@ -76,7 +78,11 @@ impl AuthToken {
         let mut nonce = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce);
         let mac = hmac_sha256(&secret, &nonce);
-        Some(format!("AUTH {} {}\n", hex_encode(&mac), hex_encode(&nonce)))
+        Some(format!(
+            "AUTH {} {}\n",
+            hex_encode(&mac),
+            hex_encode(&nonce)
+        ))
     }
 
     /// Verify a line received as the first line of an inbound connection.
@@ -96,7 +102,9 @@ impl AuthToken {
         if mac_hex.len() != HMAC_LEN * 2 || nonce_hex.len() != NONCE_LEN * 2 {
             return false;
         }
-        let Some(mac) = hex_decode(mac_hex) else { return false };
+        let Some(mac) = hex_decode(mac_hex) else {
+            return false;
+        };
         let Some(nonce) = hex_decode(nonce_hex) else {
             return false;
         };
@@ -121,7 +129,9 @@ impl AuthToken {
         };
         let Some(v) = header_value else { return false };
         let v = v.trim();
-        let Some(presented) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))
+        let Some(presented) = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
         else {
             return false;
         };
@@ -216,7 +226,10 @@ mod tests {
         let t = fixed_token();
         for _ in 0..16 {
             let line = t.make_auth_line().expect("enabled");
-            assert!(t.verify_auth_line(&line), "fresh line failed verify: {line}");
+            assert!(
+                t.verify_auth_line(&line),
+                "fresh line failed verify: {line}"
+            );
         }
     }
 

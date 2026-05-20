@@ -234,11 +234,7 @@ impl Gateway {
         path: &str,
     ) -> io::Result<()> {
         if path == "/health" {
-            return Self::send_json_response(
-                writer,
-                serde_json::json!({"status": "ok"}),
-            )
-            .await;
+            return Self::send_json_response(writer, serde_json::json!({"status": "ok"})).await;
         }
         // /ready
         let map_result = self.fetch_node_map().await;
@@ -252,7 +248,6 @@ impl Gateway {
             Self::send_error_response(writer, 503, "no ring nodes alive").await
         }
     }
-
 
     /// `/metrics` — Prometheus text format aggregated across all ring
     /// nodes. Each per-node counter is emitted with a `node="<port>"`
@@ -283,7 +278,8 @@ impl Gateway {
     /// `<key>=<value>` lines. Nodes that fail to respond are silently
     /// dropped — their absence in the output is the signal.
     async fn fetch_metrics(&self) -> Vec<(String, Vec<(String, u64)>)> {
-        let mut tasks: Vec<JoinHandle<Option<(String, Vec<(String, u64)>)>>> = Vec::new();
+        type ScrapeTask = JoinHandle<Option<(String, Vec<(String, u64)>)>>;
+        let mut tasks: Vec<ScrapeTask> = Vec::new();
         for addr in self.node_addrs.clone() {
             let token = self.auth_token.clone();
             tasks.push(tokio::spawn(Self::scrape_node_metrics(addr, token)));
@@ -324,10 +320,10 @@ impl Gateway {
                 if trimmed == "OK" {
                     break;
                 }
-                if let Some((k, v)) = trimmed.split_once('=') {
-                    if let Ok(val) = v.parse::<u64>() {
-                        accum.push((k.to_string(), val));
-                    }
+                if let Some((k, v)) = trimmed.split_once('=')
+                    && let Ok(val) = v.parse::<u64>()
+                {
+                    accum.push((k.to_string(), val));
                 }
             }
             Some(accum)
@@ -340,9 +336,7 @@ impl Gateway {
 
     /// line. Returns lowercased keys → trimmed values. The reader is left
     /// positioned at the first byte of the body (if any).
-    async fn read_http_headers<R>(
-        reader: &mut BufReader<R>,
-    ) -> io::Result<HashMap<String, String>>
+    async fn read_http_headers<R>(reader: &mut BufReader<R>) -> io::Result<HashMap<String, String>>
     where
         R: AsyncRead + Unpin,
     {
@@ -541,99 +535,98 @@ impl Gateway {
         Ok(filled)
     }
 
-/// Render a Prometheus 0.0.4 text-format response from per-node metric
-/// pairs. Each `<key>=<value>` line in the input becomes a labeled
-/// metric; the *_total naming is preserved (Prometheus convention for
-/// counters). The gauge `ouroboros_dead_nodes` gets a `# TYPE gauge`
-/// hint; everything else is a counter.
-fn render_prometheus(per_node: &[(String, Vec<(String, u64)>)]) -> String {
-    use std::collections::BTreeMap;
+    /// Render a Prometheus 0.0.4 text-format response from per-node metric
+    /// pairs. Each `<key>=<value>` line in the input becomes a labeled
+    /// metric; the *_total naming is preserved (Prometheus convention for
+    /// counters). The gauge `ouroboros_dead_nodes` gets a `# TYPE gauge`
+    /// hint; everything else is a counter.
+    fn render_prometheus(per_node: &[(String, Vec<(String, u64)>)]) -> String {
+        use std::collections::BTreeMap;
 
-    // Group by metric name across nodes for stable HELP/TYPE emission.
-    let mut by_metric: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
-    for (port, kvs) in per_node {
-        for (k, v) in kvs {
-            if k == "port" {
-                continue;
+        // Group by metric name across nodes for stable HELP/TYPE emission.
+        let mut by_metric: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+        for (port, kvs) in per_node {
+            for (k, v) in kvs {
+                if k == "port" {
+                    continue;
+                }
+                by_metric
+                    .entry(k.clone())
+                    .or_default()
+                    .push((port.clone(), *v));
             }
-            by_metric.entry(k.clone()).or_default().push((port.clone(), *v));
         }
+
+        let mut out = String::new();
+        for (name, samples) in &by_metric {
+            let metric_name = format!("ouroboros_{name}");
+            let mtype = if name.ends_with("_total") {
+                "counter"
+            } else {
+                "gauge"
+            };
+            out.push_str(&format!("# HELP {metric_name} OuroborosFS {name}\n"));
+            out.push_str(&format!("# TYPE {metric_name} {mtype}\n"));
+            for (port, val) in samples {
+                out.push_str(&format!("{metric_name}{{node=\"{port}\"}} {val}\n"));
+            }
+        }
+        out
     }
 
-    let mut out = String::new();
-    for (name, samples) in &by_metric {
-        let metric_name = format!("ouroboros_{name}");
-        let mtype = if name.ends_with("_total") {
-            "counter"
-        } else {
-            "gauge"
-        };
-        out.push_str(&format!("# HELP {metric_name} OuroborosFS {name}\n"));
-        out.push_str(&format!("# TYPE {metric_name} {mtype}\n"));
-        for (port, val) in samples {
-            out.push_str(&format!(
-                "{metric_name}{{node=\"{port}\"}} {val}\n"
-            ));
-        }
-    }
-    out
-}
+    /// `\nERR truncated expected=<u64> got=<u64>\n`. Two u64s in decimal cap
+    /// at 20 digits each; the literal text adds 32 bytes; round up to 96.
+    const MAX_TRAILER_LEN: usize = 96;
 
+    /// Marker prefix the trailer always starts with.
+    const TRAILER_MARKER: &[u8] = b"\nERR truncated ";
 
-/// `\nERR truncated expected=<u64> got=<u64>\n`. Two u64s in decimal cap
-/// at 20 digits each; the literal text adds 32 bytes; round up to 96.
-const MAX_TRAILER_LEN: usize = 96;
-
-/// Marker prefix the trailer always starts with.
-const TRAILER_MARKER: &[u8] = b"\nERR truncated ";
-
-/// Stream `src` to `dst` while keeping a lookbehind window large enough to
-/// strip a trailing `\nERR truncated …\n` line if present. Returns `true`
-/// if a trailer was detected and stripped (caller logs/surfaces the
-/// failure), `false` for a clean stream.
-///
-/// The implementation is deliberately simple: append into a `Vec`, flush
-/// everything except the last MAX_TRAILER_LEN bytes after each read, and
-/// on EOF inspect the tail. The held-back window is constant-bounded so
-/// memory is O(1) regardless of file size; the I/O pattern is the same as
-/// `tokio::io::copy` modulo the small final flush.
-async fn stream_with_truncation_detection<R, W>(
-    src: &mut R,
-    dst: &mut W,
-) -> std::io::Result<bool>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut tail: Vec<u8> = Vec::with_capacity(Self::MAX_TRAILER_LEN * 2);
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = src.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        tail.extend_from_slice(&buf[..n]);
-        if tail.len() > Self::MAX_TRAILER_LEN {
-            let flush_until = tail.len() - Self::MAX_TRAILER_LEN;
-            dst.write_all(&tail[..flush_until]).await?;
-            tail.drain(..flush_until);
-        }
-    }
-    // EOF. Inspect the lookbehind for a trailer.
-    if let Some(pos) = tail
-        .windows(Self::TRAILER_MARKER.len())
-        .rposition(|w| w == Self::TRAILER_MARKER)
+    /// Stream `src` to `dst` while keeping a lookbehind window large enough to
+    /// strip a trailing `\nERR truncated …\n` line if present. Returns `true`
+    /// if a trailer was detected and stripped (caller logs/surfaces the
+    /// failure), `false` for a clean stream.
+    ///
+    /// The implementation is deliberately simple: append into a `Vec`, flush
+    /// everything except the last MAX_TRAILER_LEN bytes after each read, and
+    /// on EOF inspect the tail. The held-back window is constant-bounded so
+    /// memory is O(1) regardless of file size; the I/O pattern is the same as
+    /// `tokio::io::copy` modulo the small final flush.
+    async fn stream_with_truncation_detection<R, W>(
+        src: &mut R,
+        dst: &mut W,
+    ) -> std::io::Result<bool>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
     {
-        // Trailer present; flush only the body bytes before it.
-        dst.write_all(&tail[..pos]).await?;
-        Ok(true)
-    } else {
-        // No trailer; flush whatever's left.
-        dst.write_all(&tail).await?;
-        Ok(false)
+        let mut tail: Vec<u8> = Vec::with_capacity(Self::MAX_TRAILER_LEN * 2);
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+            if tail.len() > Self::MAX_TRAILER_LEN {
+                let flush_until = tail.len() - Self::MAX_TRAILER_LEN;
+                dst.write_all(&tail[..flush_until]).await?;
+                tail.drain(..flush_until);
+            }
+        }
+        // EOF. Inspect the lookbehind for a trailer.
+        if let Some(pos) = tail
+            .windows(Self::TRAILER_MARKER.len())
+            .rposition(|w| w == Self::TRAILER_MARKER)
+        {
+            // Trailer present; flush only the body bytes before it.
+            dst.write_all(&tail[..pos]).await?;
+            Ok(true)
+        } else {
+            // No trailer; flush whatever's left.
+            dst.write_all(&tail).await?;
+            Ok(false)
+        }
     }
-}
-
 
     async fn handle_tcp_proxy<R>(
         self: Arc<Self>,
@@ -824,11 +817,11 @@ where
     async fn connect_to_ring(&self) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
         for addr in &self.node_addrs {
             if let Ok(mut stream) = TcpStream::connect(addr).await {
-                if let Some(line) = self.auth_token.make_auth_line() {
-                    if let Err(e) = stream.write_all(line.as_bytes()).await {
-                        tracing::warn!(node = %addr, error = ?e, "Gateway: failed to send AUTH; trying next node");
-                        continue;
-                    }
+                if let Some(line) = self.auth_token.make_auth_line()
+                    && let Err(e) = stream.write_all(line.as_bytes()).await
+                {
+                    tracing::warn!(node = %addr, error = ?e, "Gateway: failed to send AUTH; trying next node");
+                    continue;
                 }
                 return Ok(stream);
             }

@@ -21,6 +21,25 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  # Lint gate — clippy + fmt + rustdoc (NEXT_STEPS.md §5.3). All three
+  # promoted to errors; CI rejects PRs that violate any of them. The
+  # local `/lint-rust` slash command runs the same checks.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: fmt --check
+        run: cargo fmt --check
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps
+
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -45,11 +64,10 @@ jobs:
       # `cargo llvm-cov report --fail-under-lines <baseline - 2>` here.
 
   # PR-only "all tests" job. Runs the default suite *plus* the unstuck
-  # `#[ignore]`d tests (large-file streaming round-trip, subprocess heal).
-  # The two `gateway_tcp_proxy_*` ignored tests are deliberately skipped:
-  # they're pinned to a known deadlock in handle_tcp_proxy and would hang
-  # the job. See README §5 "Gaps reflected in the metric" and the
-  # documentation block in tests/gateway_http.rs.
+  # `#[ignore]`d tests (large-file streaming, subprocess heal — both
+  # the basic respawn and the §1.5b anti-entropy refill). Series I
+  # fixed the TCP-proxy deadlock so the two `gateway_tcp_proxy_*` tests
+  # now run on the default path; no `#[ignore]` filter needed for them.
   pr_full_tests:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -60,4 +78,4 @@ jobs:
       - name: Run default suite
         run: cargo test --release --verbose
       - name: Run unstuck ignored tests (heal subprocess + 100 MB streaming)
-        run: cargo test --release -- --ignored full_heal large_file_streaming
+        run: cargo test --release -- --ignored full_heal large_file_streaming respawn_inherits_storage_root anti_entropy_refills_content_after_respawn

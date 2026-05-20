@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 async fn probe(host: &str, port: u16, line: &str) -> std::io::Result<String> {
     let line_owned = line.to_string();
     let host_owned = host.to_string();
-    let result = tokio::time::timeout(Duration::from_secs(3), async move {
+    tokio::time::timeout(Duration::from_secs(3), async move {
         let mut s = TcpStream::connect((host_owned.as_str(), port)).await?;
         s.write_all(line_owned.as_bytes()).await?;
         s.shutdown().await.ok();
@@ -40,8 +40,7 @@ async fn probe(host: &str, port: u16, line: &str) -> std::io::Result<String> {
         Ok::<_, std::io::Error>(resp)
     })
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?;
-    result
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -72,10 +71,7 @@ async fn full_heal_respawns_dead_child_and_broadcasts() {
             .await
             .expect("NETMAP GET");
         // Header lines look like "<port>=Alive"; count them.
-        let alive_count = resp
-            .lines()
-            .filter(|l| l.ends_with("=Alive"))
-            .count();
+        let alive_count = resp.lines().filter(|l| l.ends_with("=Alive")).count();
         if alive_count >= 3 {
             break;
         }
@@ -104,7 +100,10 @@ async fn full_heal_respawns_dead_child_and_broadcasts() {
             Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
-    assert!(saw_refused, "killed port never showed refused; respawn raced the kill?");
+    assert!(
+        saw_refused,
+        "killed port never showed refused; respawn raced the kill?"
+    );
 
     // Wait for the heal to land. The contract: after handle_node_death
     // completes (logged "Healing process complete."), the port is bound
@@ -114,11 +113,11 @@ async fn full_heal_respawns_dead_child_and_broadcasts() {
     let pong_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut respawned = false;
     while tokio::time::Instant::now() < pong_deadline {
-        if let Ok(resp) = probe("127.0.0.1", killed_port, "NODE PING\n").await {
-            if resp.trim_end() == "PONG" {
-                respawned = true;
-                break;
-            }
+        if let Ok(resp) = probe("127.0.0.1", killed_port, "NODE PING\n").await
+            && resp.trim_end() == "PONG"
+        {
+            respawned = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -140,9 +139,7 @@ async fn full_heal_respawns_dead_child_and_broadcasts() {
             break;
         }
         if tokio::time::Instant::now() >= netmap_deadline {
-            panic!(
-                "netmap should show {killed_port} as Alive after heal; last: {resp:?}"
-            );
+            panic!("netmap should show {killed_port} as Alive after heal; last: {resp:?}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -214,10 +211,7 @@ async fn respawn_inherits_storage_root() {
         s.shutdown().await.ok();
         let mut resp = String::new();
         s.read_to_string(&mut resp).await.unwrap();
-        assert!(
-            resp.contains("OK"),
-            "expected OK after PUSH; got: {resp:?}"
-        );
+        assert!(resp.contains("OK"), "expected OK after PUSH; got: {resp:?}");
     }
     // Settle: backup-pushes are fire-and-forget.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -230,10 +224,10 @@ async fn respawn_inherits_storage_root() {
     // Wait for heal: respawn + share_data lands in ~1-3 s locally.
     let pong_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(resp) = probe("127.0.0.1", killed_port, "NODE PING\n").await {
-            if resp.trim_end() == "PONG" {
-                break;
-            }
+        if let Ok(resp) = probe("127.0.0.1", killed_port, "NODE PING\n").await
+            && resp.trim_end() == "PONG"
+        {
+            break;
         }
         if tokio::time::Instant::now() >= pong_deadline {
             panic!("respawn never PONGed within 20s");
@@ -358,7 +352,10 @@ async fn anti_entropy_refills_content_after_respawn() {
     // start empty; only the anti-entropy refill from node 0's backup/
     // can recover chunk 1.
     let node1_storage = storage.join(format!("{killed_port}"));
-    eprintln!("[heal_subprocess] killing node 1 and wiping {}", node1_storage.display());
+    eprintln!(
+        "[heal_subprocess] killing node 1 and wiping {}",
+        node1_storage.display()
+    );
     let _ = ring.children[1].start_kill();
     let _ = ring.children[1].wait().await;
     let _ = std::fs::remove_dir_all(&node1_storage);
@@ -366,10 +363,10 @@ async fn anti_entropy_refills_content_after_respawn() {
     // Wait for the heal.
     let pong_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(resp) = probe("127.0.0.1", killed_port, "NODE PING\n").await {
-            if resp.trim_end() == "PONG" {
-                break;
-            }
+        if let Ok(resp) = probe("127.0.0.1", killed_port, "NODE PING\n").await
+            && resp.trim_end() == "PONG"
+        {
+            break;
         }
         if tokio::time::Instant::now() >= pong_deadline {
             panic!("respawn never PONGed within 20s");

@@ -10,6 +10,7 @@
 //!   - "NODE HEAL"        (client -> any node)
 //!   - "NODE HEAL-HOP <token> <start_addr>" (node -> node)
 //!   - "NODE HEAL-DONE <token>"             (last node -> start node)
+#![allow(rustdoc::invalid_html_tags)]
 //!
 //! RING
 //!   - "RING FORWARD <ttl> <message...>"
@@ -44,9 +45,8 @@
 //!
 //! FILE (anti-entropy)
 //!   - "FILE CONTENT-PUSH <name> <size>" (predecessor -> respawned successor;
-//!                                         re-fills missing content/ chunks
-//!                                         after respawn from the backup/
-//!                                         the predecessor already holds)
+//!     re-fills missing content/ chunks after respawn from the backup/
+//!     the predecessor already holds)
 //!
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
@@ -512,7 +512,9 @@ mod tests {
         );
         assert_eq!(
             parse_line("NODE HEAL-DONE tok").unwrap(),
-            Command::NodeHealDone { token: "tok".into() }
+            Command::NodeHealDone {
+                token: "tok".into()
+            }
         );
     }
 
@@ -638,9 +640,7 @@ mod tests {
     #[test]
     fn file_push_chunk() {
         // 6-field shape: name chunk_size file_size parts index start_port
-        match parse_line("FILE PUSH-CHUNK myfile.part-002-of-005 4096 20480 5 1 7000")
-            .unwrap()
-        {
+        match parse_line("FILE PUSH-CHUNK myfile.part-002-of-005 4096 20480 5 1 7000").unwrap() {
             Command::FilePushChunk {
                 name,
                 chunk_size,

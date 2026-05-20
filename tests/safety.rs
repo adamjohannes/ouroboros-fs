@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{RingOpts, push_bytes, pull_bytes, rand_bytes, sha256, shutdown, spin_up};
+use common::{RingOpts, pull_bytes, push_bytes, rand_bytes, sha256, shutdown, spin_up};
 use ouroboros_fs::Gateway;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,7 +25,8 @@ async fn oversized_push_drains_does_not_oom() {
 
     let result = tokio::time::timeout(Duration::from_secs(2), async {
         let mut s = TcpStream::connect(ring.addr(0)).await?;
-        s.write_all(b"FILE PUSH 18446744073709551615 evil\n").await?;
+        s.write_all(b"FILE PUSH 18446744073709551615 evil\n")
+            .await?;
         // Don't shutdown — the post-PR1 server reads from a `reader.take(size)`
         // which yields EOF as soon as the client closes its write half. We
         // want to exercise the `tokio::io::copy(...) -> sink()` path that
@@ -100,7 +101,9 @@ async fn oversized_push_below_max_file_size_succeeds() {
     .await;
 
     let bytes = rand_bytes(8, cap as usize);
-    push_bytes(ring.addr(0), "boundary.bin", &bytes).await.unwrap();
+    push_bytes(ring.addr(0), "boundary.bin", &bytes)
+        .await
+        .unwrap();
     let got = pull_bytes(ring.addr(0), "boundary.bin").await.unwrap();
     assert_eq!(sha256(&got), sha256(&bytes));
 
@@ -143,9 +146,7 @@ async fn gateway_oversized_post_returns_413() {
         }
     };
 
-    let req = format!(
-        "POST /file/push HTTP/1.1\r\nHost: x\r\nX-Filename: evil\r\nContent-Length: 18446744073709551615\r\n\r\n"
-    );
+    let req = "POST /file/push HTTP/1.1\r\nHost: x\r\nX-Filename: evil\r\nContent-Length: 18446744073709551615\r\n\r\n";
 
     let result = tokio::time::timeout(Duration::from_secs(2), async {
         s.write_all(req.as_bytes()).await?;

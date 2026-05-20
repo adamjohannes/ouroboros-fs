@@ -152,11 +152,7 @@ async fn concurrent_pull_with_heal() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while let Some(r) = pulls.next().await {
         let got = r.expect("pull failed during heal chatter");
-        assert_eq!(
-            sha256(&got),
-            want,
-            "concurrent pull/heal corrupted bytes"
-        );
+        assert_eq!(sha256(&got), want, "concurrent pull/heal corrupted bytes");
         assert!(
             tokio::time::Instant::now() < deadline,
             "pulls didn't make progress while heal commands ran"
@@ -192,9 +188,7 @@ async fn concurrency_stress_push_pull_same_file() {
     // node." Discard `pulled` content; PR7 will tighten this.
     let addr0 = ring.addr(0);
     let v2_clone = v2.clone();
-    let push_task = tokio::spawn(async move {
-        push_bytes(addr0, "shared.bin", &v2_clone).await
-    });
+    let push_task = tokio::spawn(async move { push_bytes(addr0, "shared.bin", &v2_clone).await });
     let pull_task = tokio::spawn(async move { pull_bytes(addr0, "shared.bin").await });
 
     let push_res = push_task.await.unwrap();
@@ -250,7 +244,9 @@ async fn pull_dead_chunk_is_short_not_zero_padded() {
     // 5 chunks across 5 nodes; chunk i lives on node i.
     let total: u64 = 5 * 4096; // 20 KiB, evenly divisible
     let bytes = rand_bytes(/*seed=*/ 60, total as usize);
-    push_bytes(ring.addr(0), "doomed.bin", &bytes).await.unwrap();
+    push_bytes(ring.addr(0), "doomed.bin", &bytes)
+        .await
+        .unwrap();
 
     // Allow backup notification to populate predecessors before killing.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -302,7 +298,9 @@ async fn fanout_push_basic() {
     .await;
     let bytes = rand_bytes(/*seed=*/ 70, 16 * 1024);
     let want = sha256(&bytes);
-    push_bytes(ring.addr(0), "fanout.bin", &bytes).await.unwrap();
+    push_bytes(ring.addr(0), "fanout.bin", &bytes)
+        .await
+        .unwrap();
     let got = pull_bytes(ring.addr(0), "fanout.bin").await.unwrap();
     assert_eq!(sha256(&got), want);
     shutdown(ring).await;
@@ -375,7 +373,9 @@ async fn relay_consumed_field_honored() {
     let bytes: Vec<u8> = (0u8..10).collect();
     let want = sha256(&bytes);
 
-    push_bytes(ring.addr(0), "consumed.bin", &bytes).await.unwrap();
+    push_bytes(ring.addr(0), "consumed.bin", &bytes)
+        .await
+        .unwrap();
     let got = pull_bytes(ring.addr(0), "consumed.bin").await.unwrap();
     assert_eq!(got.len(), bytes.len());
     assert_eq!(sha256(&got), want);

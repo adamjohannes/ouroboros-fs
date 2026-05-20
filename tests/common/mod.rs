@@ -122,7 +122,9 @@ pub async fn spin_up(opts: RingOpts) -> Ring {
         for i in 0..opts.n {
             let from = nodes[i].addr;
             let to = nodes[(i + 1) % opts.n].addr;
-            send_node_next(from, to, &opts.auth_token).await.expect("NODE NEXT");
+            send_node_next(from, to, &opts.auth_token)
+                .await
+                .expect("NODE NEXT");
         }
     } else {
         // Single-node ring still needs a next hop; point it at itself.
@@ -206,7 +208,7 @@ pub async fn push_bytes(addr: SocketAddr, name: &str, bytes: &[u8]) -> std::io::
     let mut resp = String::new();
     s.read_to_string(&mut resp).await?;
     if resp.starts_with("ERR") {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, resp));
+        return Err(std::io::Error::other(resp));
     }
 
     // Settle window: relay completes asynchronously past the start node's ACK.
@@ -230,7 +232,7 @@ pub async fn pull_bytes(addr: SocketAddr, name: &str) -> std::io::Result<Vec<u8>
     s.read_to_end(&mut buf).await?;
     if buf.starts_with(b"ERR ") {
         let msg = String::from_utf8_lossy(&buf).to_string();
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+        return Err(std::io::Error::other(msg));
     }
     Ok(buf)
 }
@@ -278,11 +280,7 @@ async fn send_node_next(
     Ok(())
 }
 
-async fn fire_and_forget(
-    addr: SocketAddr,
-    line: &[u8],
-    token: &AuthToken,
-) -> std::io::Result<()> {
+async fn fire_and_forget(addr: SocketAddr, line: &[u8], token: &AuthToken) -> std::io::Result<()> {
     let mut s = TcpStream::connect(addr).await?;
     if let Some(auth) = token.make_auth_line() {
         s.write_all(auth.as_bytes()).await?;
@@ -358,7 +356,13 @@ pub async fn spin_up_with_gateway(opts: RingOpts) -> (Ring, GatewayHandle) {
         sleep(Duration::from_millis(10)).await;
     }
 
-    (ring, GatewayHandle { addr: gw_addr, task })
+    (
+        ring,
+        GatewayHandle {
+            addr: gw_addr,
+            task,
+        },
+    )
 }
 
 /// Teardown for ring + gateway pairs. Aborts the gateway accept task,
@@ -412,8 +416,9 @@ async fn http_request(
     let mut s = loop {
         match TcpStream::connect(addr).await {
             Ok(s) => break s,
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
-                && Instant::now() < connect_deadline =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && Instant::now() < connect_deadline =>
             {
                 sleep(Duration::from_millis(20)).await;
                 continue;
@@ -426,7 +431,11 @@ async fn http_request(
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
-    if !body.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+    {
         req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     req.push_str("\r\n");
@@ -449,7 +458,10 @@ fn parse_http_response(raw: &[u8]) -> std::io::Result<HttpResponse> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "no \\r\\n\\r\\n in response")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "no \\r\\n\\r\\n in response",
+            )
         })?;
     let head = std::str::from_utf8(&raw[..split])
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 head"))?;
@@ -582,14 +594,14 @@ pub mod child_ring {
                     .arg(format!("-iTCP:{port}"))
                     .arg("-sTCP:LISTEN")
                     .output();
-                if let Ok(out) = out {
-                    if let Ok(s) = String::from_utf8(out.stdout) {
-                        for pid_str in s.lines() {
-                            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                                #[cfg(unix)]
-                                unsafe {
-                                    libc::kill(pid, libc::SIGKILL);
-                                }
+                if let Ok(out) = out
+                    && let Ok(s) = String::from_utf8(out.stdout)
+                {
+                    for pid_str in s.lines() {
+                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(pid, libc::SIGKILL);
                             }
                         }
                     }

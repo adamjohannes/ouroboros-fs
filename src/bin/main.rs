@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use libc;
 use ouroboros_fs::{AuthToken, FsyncMode, run};
 use serde::Deserialize;
 use std::{env, error::Error, fs, path::Path, path::PathBuf, sync::Arc, time::Duration};
@@ -69,31 +68,31 @@ struct RunConfigWrapper {
 }
 
 fn load_run_config(path: &Path) -> Result<RunConfig, Box<dyn Error + Send + Sync>> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("read config {}: {e}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("read config {}: {e}", path.display()))?;
     // Accept either `[run]` table or top-level keys for back-compat with
     // simple deployments.
     if raw.contains("[run]") {
-        let w: RunConfigWrapper = toml::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let w: RunConfigWrapper =
+            toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         Ok(w.run)
     } else {
-        let cfg: RunConfig = toml::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let cfg: RunConfig =
+            toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         Ok(cfg)
     }
 }
 
 fn load_gateway_config(path: &Path) -> Result<GatewayConfig, Box<dyn Error + Send + Sync>> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("read config {}: {e}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("read config {}: {e}", path.display()))?;
     if raw.contains("[gateway]") {
-        let w: GatewayConfigWrapper = toml::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let w: GatewayConfigWrapper =
+            toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         Ok(w.gateway)
     } else {
-        let cfg: GatewayConfig = toml::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let cfg: GatewayConfig =
+            toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         Ok(cfg)
     }
 }
@@ -282,9 +281,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let storage_root = storage_root
                 .or(cfg.storage_root.clone())
                 .unwrap_or_else(|| PathBuf::from("nodes"));
-            let fsync_mode_cli: CliFsyncMode = fsync_mode
-                .or(cfg.fsync_mode)
-                .unwrap_or(CliFsyncMode::Full);
+            let fsync_mode_cli: CliFsyncMode =
+                fsync_mode.or(cfg.fsync_mode).unwrap_or(CliFsyncMode::Full);
             let token_str = auth_token.or(cfg.auth_token.clone());
             let idle_timeout = idle_timeout.or(cfg.idle_timeout).unwrap_or(60);
             let max_conns = max_conns.or(cfg.max_conns).unwrap_or(1024);
@@ -328,7 +326,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             } else if !cfg.nodes.is_empty() {
                 cfg.nodes
             } else {
-                return Err("no ring nodes configured: pass --node or set [gateway].nodes in --config".into());
+                return Err(
+                    "no ring nodes configured: pass --node or set [gateway].nodes in --config"
+                        .into(),
+                );
             };
             let token = resolve_auth_token(auth_token.or(cfg.auth_token))?;
             let gateway = ouroboros_fs::Gateway::with_auth(node_addrs, token);
@@ -395,9 +396,7 @@ fn normalize_addr(raw: String) -> String {
 /// Resolve the auth token: --auth-token > $OUROBOROS_AUTH_TOKEN > disabled.
 /// Disabled auth is documented as development-only; we log a warning so it
 /// shows up in production deployments by accident-detection.
-fn resolve_auth_token(
-    flag: Option<String>,
-) -> Result<AuthToken, Box<dyn Error + Send + Sync>> {
+fn resolve_auth_token(flag: Option<String>) -> Result<AuthToken, Box<dyn Error + Send + Sync>> {
     let raw = flag.or_else(|| env::var("OUROBOROS_AUTH_TOKEN").ok());
     match raw {
         Some(hex) => Ok(AuthToken::from_hex(&hex)?),
@@ -414,6 +413,7 @@ fn resolve_auth_token(
 
 // --- set-network
 
+#[allow(clippy::too_many_arguments)]
 async fn set_network(
     nodes: u16,
     base_port: u16,

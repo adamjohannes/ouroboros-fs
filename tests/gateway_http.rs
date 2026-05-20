@@ -44,7 +44,7 @@ async fn gateway_get_netmap_returns_alive_nodes() {
     assert_eq!(resp.status, 200);
     let map: HashMap<String, String> = resp.json().expect("json");
     assert_eq!(map.len(), 3);
-    for (_port, status) in &map {
+    for status in map.values() {
         assert_eq!(status, "Alive", "expected all alive: {map:?}");
     }
     teardown(ring, gw).await;
@@ -81,8 +81,12 @@ async fn gateway_get_file_list_empty_returns_empty_array() {
 async fn gateway_get_file_list_returns_pushed_files() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     // Push two files via the ring (start node = 0).
-    push_bytes(ring.addr(0), "alpha.bin", b"hello").await.unwrap();
-    push_bytes(ring.addr(0), "beta.bin", b"world").await.unwrap();
+    push_bytes(ring.addr(0), "alpha.bin", b"hello")
+        .await
+        .unwrap();
+    push_bytes(ring.addr(0), "beta.bin", b"world")
+        .await
+        .unwrap();
     // The Gateway's `connect_to_ring` round-robins; the file_tags landed on
     // every chunk owner during push, so any surviving node's list works.
     let resp = http_get(gw.addr, "/file/list").await.unwrap();
@@ -105,7 +109,9 @@ async fn gateway_post_file_push_round_trip() {
         ("Content-Type", "application/octet-stream"),
         ("Content-Length", &payload_len),
     ];
-    let resp = http_post(gw.addr, "/file/push", headers, &payload).await.unwrap();
+    let resp = http_post(gw.addr, "/file/push", headers, &payload)
+        .await
+        .unwrap();
     assert_eq!(resp.status, 200);
     assert!(resp.body_str().contains("\"status\":\"ok\""));
 
@@ -125,9 +131,15 @@ async fn gateway_post_missing_x_filename_returns_500() {
     let body = b"hi";
     let len = body.len().to_string();
     let headers: &[(&str, &str)] = &[("Content-Length", &len)];
-    let resp = http_post(gw.addr, "/file/push", headers, body).await.unwrap();
+    let resp = http_post(gw.addr, "/file/push", headers, body)
+        .await
+        .unwrap();
     assert_eq!(resp.status, 500);
-    assert!(resp.body_str().contains("Missing"), "body: {}", resp.body_str());
+    assert!(
+        resp.body_str().contains("Missing"),
+        "body: {}",
+        resp.body_str()
+    );
     teardown(ring, gw).await;
 }
 
@@ -136,7 +148,9 @@ async fn gateway_post_missing_content_length_returns_500() {
     // X-Filename present, body absent → content_length=0 path.
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let headers: &[(&str, &str)] = &[("X-Filename", "x.bin"), ("Content-Length", "0")];
-    let resp = http_post(gw.addr, "/file/push", headers, &[]).await.unwrap();
+    let resp = http_post(gw.addr, "/file/push", headers, &[])
+        .await
+        .unwrap();
     assert_eq!(resp.status, 500);
     teardown(ring, gw).await;
 }
@@ -147,7 +161,9 @@ async fn gateway_post_missing_content_length_returns_500() {
 async fn gateway_get_file_pull_streams_bytes() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let payload = rand_bytes(/*seed=*/ 410, 4096);
-    push_bytes(ring.addr(0), "stream.bin", &payload).await.unwrap();
+    push_bytes(ring.addr(0), "stream.bin", &payload)
+        .await
+        .unwrap();
 
     let resp = http_get(gw.addr, "/file/pull/stream.bin").await.unwrap();
     assert_eq!(resp.status, 200);
@@ -178,7 +194,9 @@ async fn gateway_get_file_pull_empty_path_returns_404() {
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_get_file_pull_missing_file_returns_404() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
-    let resp = http_get(gw.addr, "/file/pull/does-not-exist.bin").await.unwrap();
+    let resp = http_get(gw.addr, "/file/pull/does-not-exist.bin")
+        .await
+        .unwrap();
     assert_eq!(resp.status, 404, "body: {:?}", resp.body_str());
     teardown(ring, gw).await;
 }
@@ -230,8 +248,14 @@ async fn gateway_metrics_returns_prometheus_text() {
     let body = resp.body_str();
     // Sanity: standard Prometheus text-format hints + at least one of our
     // metric names labeled with a node port.
-    assert!(body.contains("# TYPE ouroboros_pushes_total counter"), "body: {body}");
-    assert!(body.contains("ouroboros_pulls_total{node=\""), "body: {body}");
+    assert!(
+        body.contains("# TYPE ouroboros_pushes_total counter"),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("ouroboros_pulls_total{node=\""),
+        "body: {body}"
+    );
     teardown(ring, gw).await;
 }
 
@@ -245,12 +269,11 @@ async fn gateway_metrics_pushes_total_increments_after_push() {
     fn extract_total(body: &str, name: &str) -> u64 {
         let mut sum = 0u64;
         for line in body.lines() {
-            if line.starts_with(&format!("ouroboros_{name}{{node=")) {
-                if let Some((_, val)) = line.rsplit_once(' ') {
-                    if let Ok(v) = val.parse::<u64>() {
-                        sum += v;
-                    }
-                }
+            if line.starts_with(&format!("ouroboros_{name}{{node="))
+                && let Some((_, val)) = line.rsplit_once(' ')
+                && let Ok(v) = val.parse::<u64>()
+            {
+                sum += v;
             }
         }
         sum
@@ -260,7 +283,9 @@ async fn gateway_metrics_pushes_total_increments_after_push() {
         &http_get(gw.addr, "/metrics").await.unwrap().body_str(),
         "pushes_total",
     );
-    push_bytes(ring.addr(0), "metric.bin", b"hello").await.unwrap();
+    push_bytes(ring.addr(0), "metric.bin", b"hello")
+        .await
+        .unwrap();
     let after = extract_total(
         &http_get(gw.addr, "/metrics").await.unwrap().body_str(),
         "pushes_total",
@@ -345,7 +370,8 @@ async fn gateway_unknown_method_returns_proxied_error() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let _ = tokio::time::timeout(Duration::from_millis(500), async {
         let mut s = TcpStream::connect(gw.addr).await?;
-        s.write_all(b"PUT /file/list HTTP/1.1\r\nHost: x\r\n\r\n").await?;
+        s.write_all(b"PUT /file/list HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await?;
         s.shutdown().await.ok();
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await?;
@@ -382,8 +408,7 @@ async fn gateway_connect_to_ring_all_dead_returns_500() {
     let resp = http_get(gw.addr, "/file/list").await.unwrap();
     assert_eq!(resp.status, 500);
     assert!(
-        resp.body_str().contains("Could not connect")
-            || resp.body_str().contains("connect"),
+        resp.body_str().contains("Could not connect") || resp.body_str().contains("connect"),
         "body: {}",
         resp.body_str()
     );
@@ -440,7 +465,7 @@ async fn gateway_tcp_proxy_passes_through_file_push_pull() {
         let mut resp = String::new();
         s.read_to_string(&mut resp).await?;
         if resp.starts_with("ERR") {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, resp));
+            return Err(std::io::Error::other(resp));
         }
         Ok(())
     })
@@ -484,7 +509,9 @@ async fn gateway_pull_strips_truncation_trailer_from_body() {
     .await;
 
     let payload = rand_bytes(/*seed=*/ 700, 256 * 1024);
-    push_bytes(ring.addr(0), "trunc.bin", &payload).await.unwrap();
+    push_bytes(ring.addr(0), "trunc.bin", &payload)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Kill chunk-2 owner + its predecessor (the backup holder). The pull
@@ -499,7 +526,9 @@ async fn gateway_pull_strips_truncation_trailer_from_body() {
     // The HTTP body must NOT contain the trailer text — the gateway
     // strips it before flushing. The body is shorter than the original.
     assert!(
-        !resp.body.windows(b"ERR truncated".len())
+        !resp
+            .body
+            .windows(b"ERR truncated".len())
             .any(|w| w == b"ERR truncated"),
         "trailer leaked into HTTP body"
     );

@@ -154,6 +154,11 @@ impl std::fmt::Debug for Node {
 }
 
 impl Node {
+    // Wide-by-design: every per-node knob (gossip, file_size, fsync mode,
+    // auth, idle timeout, max_conns, etc.) is exposed individually. A
+    // `NodeOpts` builder is on the v1.1 list; for now this is the most
+    // direct API for callers (binary, tests, future SDK).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         port: String,
         gossip_interval: Duration,
@@ -251,7 +256,7 @@ impl Node {
             .into_iter()
             .map(|(name, tag)| {
                 // Replace special chars in name to avoid parsing errors
-                let safe_name = name.replace(':', "_").replace(';', "_");
+                let safe_name = name.replace([':', ';'], "_");
                 format!("{}:{}:{}:{}", safe_name, tag.start, tag.size, tag.parts)
             })
             .collect::<Vec<_>>()
@@ -602,9 +607,11 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use super::{FsyncMode, Node, append_edge, host_str, parse_entries, port_str, serialize_entries};
-    use crate::auth::AuthToken;
+    use super::{
+        FsyncMode, Node, append_edge, host_str, parse_entries, port_str, serialize_entries,
+    };
     use crate::NodeStatus;
+    use crate::auth::AuthToken;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -659,11 +666,7 @@ mod tests {
 
     #[test]
     fn append_edge_subsequent() {
-        let h = append_edge(
-            "7000->7001".into(),
-            "127.0.0.1:7001",
-            "127.0.0.1:7002",
-        );
+        let h = append_edge("7000->7001".into(), "127.0.0.1:7001", "127.0.0.1:7002");
         assert_eq!(h, "7000->7001;7001->7002");
     }
 
@@ -792,7 +795,8 @@ mod tests {
     #[tokio::test]
     async fn update_node_status_then_get_lines() {
         let node = test_node("127.0.0.1:7000");
-        node.update_node_status("7001".into(), NodeStatus::Dead).await;
+        node.update_node_status("7001".into(), NodeStatus::Dead)
+            .await;
         let lines = node.get_network_nodes_lines().await;
         assert_eq!(lines, vec!["7001=Dead"]);
     }
@@ -809,7 +813,8 @@ mod tests {
     #[tokio::test]
     async fn set_topology_from_history_basic() {
         let node = test_node("127.0.0.1:7000");
-        node.set_topology_from_history("7000->7001;7001->7002").await;
+        node.set_topology_from_history("7000->7001;7001->7002")
+            .await;
         let m = node.topology_map.read().await;
         assert_eq!(m.get("7000"), Some(&"7001".to_string()));
         assert_eq!(m.get("7001"), Some(&"7002".to_string()));
@@ -830,7 +835,8 @@ mod tests {
     #[tokio::test]
     async fn set_topology_from_history_skips_malformed() {
         let node = test_node("127.0.0.1:7000");
-        node.set_topology_from_history("7000->7001;garbage;7001->7002").await;
+        node.set_topology_from_history("7000->7001;garbage;7001->7002")
+            .await;
         let m = node.topology_map.read().await;
         assert_eq!(m.len(), 2);
     }
@@ -859,7 +865,8 @@ mod tests {
     #[tokio::test]
     async fn set_file_tags_from_entries_basic() {
         let node = test_node("127.0.0.1:7000");
-        node.set_file_tags_from_entries("a:7000:1024:3;b:7001:2048:5").await;
+        node.set_file_tags_from_entries("a:7000:1024:3;b:7001:2048:5")
+            .await;
         let tags = node.file_tags.read().await;
         let a = tags.get("a").unwrap();
         assert_eq!(a.start, 7000);
@@ -884,7 +891,8 @@ mod tests {
     #[tokio::test]
     async fn set_file_tags_from_entries_skips_bad_numerics() {
         let node = test_node("127.0.0.1:7000");
-        node.set_file_tags_from_entries("a:notnum:1:1;b:7001:2048:5").await;
+        node.set_file_tags_from_entries("a:notnum:1:1;b:7001:2048:5")
+            .await;
         let tags = node.file_tags.read().await;
         assert!(!tags.contains_key("a"));
         assert!(tags.contains_key("b"));
@@ -973,7 +981,10 @@ mod tests {
         let dbg = format!("{n:?}");
         // Things that must NOT appear:
         assert!(!dbg.contains("file_tags"), "leaked file_tags: {dbg}");
-        assert!(!dbg.contains("network_nodes"), "leaked network_nodes: {dbg}");
+        assert!(
+            !dbg.contains("network_nodes"),
+            "leaked network_nodes: {dbg}"
+        );
         assert!(!dbg.contains("storage_root"), "leaked storage_root: {dbg}");
         assert!(!dbg.contains("topology_map"), "leaked topology_map: {dbg}");
         assert!(!dbg.contains("/tmp/"), "leaked filesystem path: {dbg}");

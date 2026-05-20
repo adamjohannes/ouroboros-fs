@@ -27,6 +27,9 @@ type AnyErr = Box<dyn Error + Send + Sync>;
 ///   1. bind every node (collecting OS-assigned ports when bound to `:0`),
 ///   2. wire the ring with `NODE NEXT` *before* any node starts accepting,
 ///   3. spawn `serve()` per node and abort that handle to "kill" a node.
+// Wide-by-design: same rationale as `Node::new` — every per-node knob is
+// exposed individually. A grouped `BindOpts` struct is a v1.1 ergonomics win.
+#[allow(clippy::too_many_arguments)]
 pub async fn bind(
     bind_addr: &str,
     gossip_interval: Duration,
@@ -235,7 +238,9 @@ pub async fn serve_with_shutdown(
     // get `ERR server busy\n` and a prompt close instead of waiting in
     // the kernel accept queue. (NEXT_STEPS.md §2.4.)
     let conn_sem = if node.max_conns > 0 {
-        Some(Arc::new(tokio::sync::Semaphore::new(node.max_conns as usize)))
+        Some(Arc::new(tokio::sync::Semaphore::new(
+            node.max_conns as usize,
+        )))
     } else {
         None
     };
@@ -290,9 +295,7 @@ pub async fn serve_with_shutdown(
     // Drain phase. `drain_timeout == ZERO` means wait indefinitely — used
     // by the back-compat `serve` path so test aborts still kill the task
     // instantly via JoinHandle::abort.
-    let drain = async {
-        while handlers.join_next().await.is_some() {}
-    };
+    let drain = async { while handlers.join_next().await.is_some() {} };
     if drain_timeout.is_zero() {
         drain.await;
     } else {
@@ -317,6 +320,8 @@ pub async fn serve_with_shutdown(
 /// Run a single ring node: bind, then serve until SIGTERM/SIGINT, then
 /// drain in-flight handlers up to `shutdown_timeout`. Used by the binary;
 /// tests use [`bind`] + [`serve`] directly.
+// Wide-by-design: mirrors `bind`'s argument set. Same v1.1 plan.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     bind_addr: &str,
     gossip_interval: Duration,
@@ -393,11 +398,8 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
     // diagnose it without packet captures.
     if node.auth_token.is_enabled() {
         let mut auth_line = String::new();
-        let read = tokio::time::timeout(
-            Duration::from_secs(1),
-            reader.read_line(&mut auth_line),
-        )
-        .await;
+        let read =
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut auth_line)).await;
         let n = match read {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e.into()),
@@ -602,14 +604,8 @@ async fn handle_node_metrics<W: AsyncWrite + Unpin>(
     let port = port_str(&node.port);
     let lines = [
         format!("port={}", port),
-        format!(
-            "pushes_total={}",
-            node.pushes_total.load(Ordering::Relaxed)
-        ),
-        format!(
-            "pulls_total={}",
-            node.pulls_total.load(Ordering::Relaxed)
-        ),
+        format!("pushes_total={}", node.pushes_total.load(Ordering::Relaxed)),
+        format!("pulls_total={}", node.pulls_total.load(Ordering::Relaxed)),
         format!(
             "chunk_bytes_written_total={}",
             node.chunk_bytes_written_total.load(Ordering::Relaxed)
@@ -1113,7 +1109,7 @@ async fn durably_write_chunk<R: AsyncRead + Unpin>(
             f.sync_all()
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+        .map_err(std::io::Error::other)??;
     }
     Ok(written)
 }
@@ -1205,7 +1201,10 @@ where
     node.chunk_bytes_written_total
         .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
 
-    debug_assert!(validate_filename(&name).is_ok(), "unvalidated name {name:?}");
+    debug_assert!(
+        validate_filename(&name).is_ok(),
+        "unvalidated name {name:?}"
+    );
 
     let parts: u32 = node.network_size().await as u32;
     let start_port_num: u16 = port_str(&node.port).parse().unwrap_or(0);
@@ -1216,10 +1215,7 @@ where
     // `fanout_push_parts_eq_one` pins.
     if parts == 1 {
         let chunk_name = chunk_file_name(&name, 0, parts);
-        let dir = node
-            .storage_root
-            .join(port_str(&node.port))
-            .join("content");
+        let dir = node.storage_root.join(port_str(&node.port)).join("content");
         durably_write_chunk(&dir, &chunk_name, &mut *reader, size, node.fsync_mode).await?;
 
         let node_clone = Arc::clone(&node);
@@ -1245,7 +1241,9 @@ where
         let mut current = port_str(&node.port).to_string();
         for _ in 1..parts {
             let Some(next) = topology.get(&current).cloned() else {
-                writer.write_all(b"ERR topology incomplete; cannot fan out\n").await?;
+                writer
+                    .write_all(b"ERR topology incomplete; cannot fan out\n")
+                    .await?;
                 let mut limited = (&mut *reader).take(size);
                 tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
                 return Ok(());
@@ -1267,16 +1265,17 @@ where
             Ok::<(String, TcpStream), AnyErr>((addr, s))
         }
     });
-    let mut conns: Vec<(String, TcpStream)> = match futures::future::try_join_all(connect_futures).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(node = %node.port, error = ?e, "Fan-out connect failed");
-            writer.write_all(b"ERR fan-out connect failed\n").await?;
-            let mut limited = (&mut *reader).take(size);
-            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
-            return Ok(());
-        }
-    };
+    let mut conns: Vec<(String, TcpStream)> =
+        match futures::future::try_join_all(connect_futures).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(node = %node.port, error = ?e, "Fan-out connect failed");
+                writer.write_all(b"ERR fan-out connect failed\n").await?;
+                let mut limited = (&mut *reader).take(size);
+                tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+                return Ok(());
+            }
+        };
 
     // Send a PUSH-CHUNK header per outbound connection up front so the
     // receivers know how many bytes to expect. Chunk lengths come from
@@ -1291,7 +1290,9 @@ where
         );
         if let Err(e) = s.write_all(header.as_bytes()).await {
             tracing::error!(node = %node.port, error = ?e, "Failed to send PUSH-CHUNK header");
-            writer.write_all(b"ERR fan-out header write failed\n").await?;
+            writer
+                .write_all(b"ERR fan-out header write failed\n")
+                .await?;
             let mut limited = (&mut *reader).take(size);
             tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
             return Ok(());
@@ -1302,12 +1303,16 @@ where
     // here; chunks 1..parts-1 stream straight to the corresponding
     // outbound conn (zero buffering on the start node).
     let chunk0_name = chunk_file_name(&name, 0, parts);
-    let content_dir = node
-        .storage_root
-        .join(port_str(&node.port))
-        .join("content");
+    let content_dir = node.storage_root.join(port_str(&node.port)).join("content");
     let len0 = fair_chunk_len(0, size, parts);
-    durably_write_chunk(&content_dir, &chunk0_name, &mut *reader, len0, node.fsync_mode).await?;
+    durably_write_chunk(
+        &content_dir,
+        &chunk0_name,
+        &mut *reader,
+        len0,
+        node.fsync_mode,
+    )
+    .await?;
 
     // Backup chunk 0 to predecessor.
     let node_clone = Arc::clone(&node);
@@ -1372,6 +1377,9 @@ where
 /// Receiver side of fan-out PUSH. Streams `chunk_size` bytes from the
 /// connection straight to disk, tags the file, kicks off backup-push,
 /// replies `OK\n`. Replaces the older RELAY-STREAM hop handler.
+// Wide-by-design: receives the full PUSH-CHUNK header (name, sizes,
+// indices, start_port). A grouped struct would just rename the args.
+#[allow(clippy::too_many_arguments)]
 async fn handle_file_push_chunk<R, W>(
     node: Arc<Node>,
     reader: &mut R,
@@ -1404,10 +1412,7 @@ where
     node.set_file_tag(&parent_name, start_port, file_size, parts)
         .await;
 
-    let dir = node
-        .storage_root
-        .join(port_str(&node.port))
-        .join("content");
+    let dir = node.storage_root.join(port_str(&node.port)).join("content");
     durably_write_chunk(&dir, &name, reader, chunk_size, node.fsync_mode).await?;
 
     tracing::info!(
@@ -1538,10 +1543,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let dir = node
-        .storage_root
-        .join(port_str(&node.port))
-        .join("backup");
+    let dir = node.storage_root.join(port_str(&node.port)).join("backup");
     fs::create_dir_all(&dir).await.ok();
     durably_write_chunk(&dir, &name, reader, size, node.fsync_mode).await?;
 
@@ -1571,10 +1573,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let dir = node
-        .storage_root
-        .join(port_str(&node.port))
-        .join("content");
+    let dir = node.storage_root.join(port_str(&node.port)).join("content");
     fs::create_dir_all(&dir).await.ok();
     durably_write_chunk(&dir, &name, reader, size, node.fsync_mode).await?;
 
@@ -1714,9 +1713,10 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
                 // Arc owned by `pull_file_from_ring` and not exposed past
                 // the function. Semaphores only return `Closed` after an
                 // explicit `close()` call, which we never make.
-                let _permit = sem.acquire_owned().await.expect(
-                    "semaphore is local to pull_file_from_ring; never closed",
-                );
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore is local to pull_file_from_ring; never closed");
                 let r = request_chunk_from(&owner_addr, &chunk_name, &token).await;
                 (i, chunk_name, owner_addr, owner_port, r)
             }
@@ -1802,10 +1802,7 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
     // short body (the existing behavior); aware clients (the gateway,
     // newer SDKs) can read past EOF and surface the error.
     if emitted < file_size {
-        let trailer = format!(
-            "\nERR truncated expected={} got={}\n",
-            file_size, emitted
-        );
+        let trailer = format!("\nERR truncated expected={} got={}\n", file_size, emitted);
         writer.write_all(trailer.as_bytes()).await?;
         tracing::error!(
             node = %node.port,
@@ -1870,7 +1867,7 @@ async fn request_chunk_from(
     reader.read_exact(&mut buf).await?;
 
     // Ensure the is writer not dropped too early
-    let _ = (&mut w).shutdown().await;
+    let _ = w.shutdown().await;
 
     Ok((buf, next_addr))
 }
@@ -1909,7 +1906,7 @@ async fn request_backup_chunk_from(
     reader.read_exact(&mut buf).await?;
 
     // ensure writer not dropped too early
-    let _ = (&mut w).shutdown().await;
+    let _ = w.shutdown().await;
 
     Ok((buf, next_addr))
 }
@@ -1943,10 +1940,7 @@ async fn handle_file_list_csv<W: AsyncWrite + Unpin>(
 /// No-op when the token is disabled. Callers must invoke this BEFORE the
 /// first protocol command on every internal connection (gossip, fan-out,
 /// pull, backup-push, heal share, gateway → ring).
-async fn send_auth<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    token: &AuthToken,
-) -> Result<(), AnyErr> {
+async fn send_auth<W: AsyncWrite + Unpin>(writer: &mut W, token: &AuthToken) -> Result<(), AnyErr> {
     if let Some(line) = token.make_auth_line() {
         writer.write_all(line.as_bytes()).await?;
     }
@@ -2166,10 +2160,7 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
 
     // Tests disable respawn so a killed node stays dead — the rest of the
     // ring's failover paths still get exercised.
-    if !node
-        .respawn_dead
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if !node.respawn_dead.load(std::sync::atomic::Ordering::Relaxed) {
         tracing::info!(node = %node.port, dead_node = %full_dead_addr, "Respawn disabled; leaving node dead");
         return Ok(());
     }
@@ -2324,14 +2315,8 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
 /// `FILE CONTENT-PUSH`. The successor writes them into its content/
 /// directory. Skips orphan `*.partial` files (the startup janitor will
 /// also sweep these on the receiver side).
-async fn anti_entropy_refill_successor(
-    node: &Node,
-    successor_addr: &str,
-) -> Result<(), AnyErr> {
-    let backup_dir = node
-        .storage_root
-        .join(port_str(&node.port))
-        .join("backup");
+async fn anti_entropy_refill_successor(node: &Node, successor_addr: &str) -> Result<(), AnyErr> {
+    let backup_dir = node.storage_root.join(port_str(&node.port)).join("backup");
     let mut entries = match fs::read_dir(&backup_dir).await {
         Ok(it) => it,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2392,12 +2377,7 @@ async fn anti_entropy_refill_successor(
     Ok(())
 }
 
-async fn push_content_to(
-    node: &Node,
-    addr: &str,
-    name: &str,
-    body: &[u8],
-) -> Result<(), AnyErr> {
+async fn push_content_to(node: &Node, addr: &str, name: &str, body: &[u8]) -> Result<(), AnyErr> {
     let mut s = TcpStream::connect(addr).await?;
     send_auth(&mut s, &node.auth_token).await?;
     let header = format!("FILE CONTENT-PUSH {} {}\n", name, body.len());
@@ -2408,12 +2388,9 @@ async fn push_content_to(
     // Read the OK ack so we don't race the receiver's fsync.
     let mut reader = BufReader::new(&mut s);
     let mut buf = String::new();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        reader.read_line(&mut buf),
-    )
-    .await
-    .map_err(|_| "anti-entropy ack timed out")?;
+    let _ = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+        .await
+        .map_err(|_| "anti-entropy ack timed out")?;
     if !buf.starts_with("OK") {
         return Err(format!("CONTENT-PUSH did not OK: {buf:?}").into());
     }
@@ -2486,7 +2463,13 @@ mod tests {
 
     #[test]
     fn fair_chunk_len_sum_invariant() {
-        for &(parts, size) in &[(1u32, 1u64), (1, 1 << 20), (3, 7), (5, 1 << 20), (7, 123_456)] {
+        for &(parts, size) in &[
+            (1u32, 1u64),
+            (1, 1 << 20),
+            (3, 7),
+            (5, 1 << 20),
+            (7, 123_456),
+        ] {
             let total: u64 = (0..parts).map(|i| fair_chunk_len(i, size, parts)).sum();
             assert_eq!(total, size, "parts={parts} size={size}");
         }
@@ -2617,10 +2600,7 @@ mod tests {
     #[test]
     fn chunk_file_name_zero_pads_3_digits_at_boundary() {
         // 100 chunks: index 99 maps to part 100 of 100, three-digit field.
-        assert_eq!(
-            chunk_file_name("x", 99, 100),
-            "x.part-100-of-100"
-        );
+        assert_eq!(chunk_file_name("x", 99, 100), "x.part-100-of-100");
     }
 
     #[test]

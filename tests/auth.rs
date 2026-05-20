@@ -154,7 +154,9 @@ async fn authed_round_trip_succeeds() {
 async fn disabled_auth_preserves_legacy_round_trip() {
     let ring = spin_up(RingOpts::default()).await; // auth_token = disabled
     let payload = b"plain";
-    push_bytes(ring.addr(0), "plain.bin", payload).await.unwrap();
+    push_bytes(ring.addr(0), "plain.bin", payload)
+        .await
+        .unwrap();
     let got = pull_bytes(ring.addr(0), "plain.bin").await.unwrap();
     assert_eq!(sha256(&got), sha256(payload));
     shutdown(ring).await;
@@ -185,7 +187,9 @@ async fn http_get_with_wrong_bearer_is_401() {
     .await;
     let bad = format!("Bearer {}", other_token().bearer_value().unwrap());
     let headers: &[(&str, &str)] = &[("Authorization", &bad)];
-    let resp = http_get_with_headers(gw.addr, "/file/list", headers).await.unwrap();
+    let resp = http_get_with_headers(gw.addr, "/file/list", headers)
+        .await
+        .unwrap();
     assert_eq!(resp.status, 401);
     teardown_authed(ring, gw).await;
 }
@@ -200,7 +204,9 @@ async fn http_get_with_correct_bearer_succeeds() {
     .await;
     let good = format!("Bearer {}", fixed_token().bearer_value().unwrap());
     let headers: &[(&str, &str)] = &[("Authorization", &good)];
-    let resp = http_get_with_headers(gw.addr, "/file/list", headers).await.unwrap();
+    let resp = http_get_with_headers(gw.addr, "/file/list", headers)
+        .await
+        .unwrap();
     assert_eq!(resp.status, 200);
     teardown_authed(ring, gw).await;
 }
@@ -236,7 +242,9 @@ async fn http_post_push_with_bearer_round_trip() {
         ("X-Filename", "http-authed.bin"),
         ("Content-Type", "application/octet-stream"),
     ];
-    let resp = http_post(gw.addr, "/file/push", headers, payload).await.unwrap();
+    let resp = http_post(gw.addr, "/file/push", headers, payload)
+        .await
+        .unwrap();
     assert_eq!(resp.status, 200);
 
     teardown_authed(ring, gw).await;

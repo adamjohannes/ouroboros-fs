@@ -89,7 +89,10 @@ async fn max_conns_saturated_returns_busy() {
     let mut s3 = TcpStream::connect(ring.addr(0)).await.unwrap();
     let mut buf = String::new();
     let read = tokio::time::timeout(Duration::from_secs(2), s3.read_to_string(&mut buf)).await;
-    assert!(read.is_ok(), "third connection should have been promptly closed");
+    assert!(
+        read.is_ok(),
+        "third connection should have been promptly closed"
+    );
     assert!(
         buf.starts_with("ERR server busy"),
         "expected busy ERR; got: {buf:?}"

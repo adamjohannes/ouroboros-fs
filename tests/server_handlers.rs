@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 /// Wraps in a 2-second timeout so handler hangs fail loudly.
 async fn send_line(addr: std::net::SocketAddr, line: &str) -> std::io::Result<String> {
     let line_owned = line.to_string();
-    let result = tokio::time::timeout(Duration::from_secs(2), async move {
+    tokio::time::timeout(Duration::from_secs(2), async move {
         let mut s = TcpStream::connect(addr).await?;
         s.write_all(line_owned.as_bytes()).await?;
         s.shutdown().await.ok();
@@ -23,8 +23,7 @@ async fn send_line(addr: std::net::SocketAddr, line: &str) -> std::io::Result<St
         Ok::<_, std::io::Error>(resp)
     })
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "send_line timed out"))?;
-    result
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "send_line timed out"))?
 }
 
 // ---------- NODE handlers ----------
@@ -35,8 +34,14 @@ async fn node_status_returns_port_and_next() {
     let resp = send_line(ring.addr(0), "NODE STATUS\n").await.unwrap();
     let port0 = ring.addr(0).port();
     let port1 = ring.addr(1).port();
-    assert!(resp.contains(&format!("PORT 127.0.0.1:{port0}")), "resp: {resp:?}");
-    assert!(resp.contains(&format!("NEXT 127.0.0.1:{port1}")), "resp: {resp:?}");
+    assert!(
+        resp.contains(&format!("PORT 127.0.0.1:{port0}")),
+        "resp: {resp:?}"
+    );
+    assert!(
+        resp.contains(&format!("NEXT 127.0.0.1:{port1}")),
+        "resp: {resp:?}"
+    );
     assert!(resp.trim_end().ends_with("OK"), "resp: {resp:?}");
     shutdown(ring).await;
 }
@@ -51,7 +56,10 @@ async fn node_status_self_loop_when_n_eq_one() {
     .await;
     let resp = send_line(ring.addr(0), "NODE STATUS\n").await.unwrap();
     let port = ring.addr(0).port();
-    assert!(resp.contains(&format!("NEXT 127.0.0.1:{port}")), "resp: {resp:?}");
+    assert!(
+        resp.contains(&format!("NEXT 127.0.0.1:{port}")),
+        "resp: {resp:?}"
+    );
     shutdown(ring).await;
 }
 
@@ -128,12 +136,9 @@ async fn ring_forward_ttl_one_acks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn topology_set_directly_populates_map() {
     let ring = spin_up(RingOpts::default()).await;
-    let resp = send_line(
-        ring.addr(0),
-        "TOPOLOGY SET 9000->9001;9001->9002\n",
-    )
-    .await
-    .unwrap();
+    let resp = send_line(ring.addr(0), "TOPOLOGY SET 9000->9001;9001->9002\n")
+        .await
+        .unwrap();
     assert!(resp.starts_with("OK"), "resp: {resp:?}");
     {
         let m = ring.nodes[0].node.topology_map.read().await;
@@ -227,7 +232,9 @@ async fn netmap_get_empty_state_returns_empty_marker() {
     .unwrap();
     let serve_task = tokio::spawn({
         let node = Arc::clone(&node);
-        async move { serve(node, listener).await; }
+        async move {
+            serve(node, listener).await;
+        }
     });
 
     let resp = send_line(addr, "NETMAP GET\n").await.unwrap();

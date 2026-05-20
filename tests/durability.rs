@@ -23,7 +23,9 @@ async fn fsync_full_round_trip_small_file() {
     .await;
 
     let payload = b"durable-bytes-here";
-    push_bytes(ring.addr(0), "durable.bin", payload).await.unwrap();
+    push_bytes(ring.addr(0), "durable.bin", payload)
+        .await
+        .unwrap();
     let got = pull_bytes(ring.addr(0), "durable.bin").await.unwrap();
     assert_eq!(sha256(&got), sha256(payload));
 
@@ -42,7 +44,9 @@ async fn no_partial_files_remain_after_push() {
     })
     .await;
 
-    push_bytes(ring.addr(0), "p.bin", &[0xAB; 4096]).await.unwrap();
+    push_bytes(ring.addr(0), "p.bin", &[0xAB; 4096])
+        .await
+        .unwrap();
 
     // Touch every node's storage tree.
     let storage = ring._tmp_path();
@@ -199,10 +203,7 @@ async fn bind_refuses_unversioned_existing_tree() {
     .await;
     assert!(result.is_err(), "expected bind to refuse unversioned tree");
     let msg = result.err().unwrap().to_string();
-    assert!(
-        msg.contains("unversioned"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("unversioned"), "unexpected error: {msg}");
 }
 
 /// Pre-create an orphan `<chunk>.partial` in a node's content dir, then bind
