@@ -167,16 +167,24 @@ async fn backup_present_after_push() {
             .join("backup")
             .join(&chunk_name);
 
-        let body = std::fs::read(&path).unwrap_or_else(|e| {
+        let raw = std::fs::read(&path).unwrap_or_else(|e| {
             panic!(
                 "backup missing on node {i} at {}: {e}",
                 path.display()
             )
         });
+        // Series B trailer: the on-disk chunk is `body || sha256(body)`.
+        // Strip the 32-byte trailer before hashing the body for comparison.
+        assert!(
+            raw.len() >= 32,
+            "backup file shorter than trailer on node {i}: {} bytes",
+            raw.len()
+        );
+        let body = &raw[..raw.len() - 32];
         let start = (owner_chunk_index as usize) * chunk_size;
         let end = start + chunk_size;
         assert_eq!(
-            sha256(&body),
+            sha256(body),
             sha256(&bytes[start..end]),
             "backup on node {i} for chunk {} corrupt",
             owner_chunk_index + 1

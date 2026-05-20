@@ -133,3 +133,54 @@ async fn bind_sweeps_orphan_partials() {
         "non-partial file should not be touched by janitor"
     );
 }
+
+/// Bit-rot a chunk on disk between PUSH and PULL. The owner's GET-CHUNK
+/// must detect the trailer-hash mismatch and respond with size=0, which
+/// causes the puller to fall through to the predecessor's backup. End
+/// result: the client sees the original bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn bit_rot_in_content_falls_through_to_backup() {
+    let ring = spin_up(RingOpts {
+        n: 3,
+        ..RingOpts::default()
+    })
+    .await;
+
+    let payload = b"clean payload bytes that will be rotted on disk";
+    push_bytes(ring.addr(0), "rot.bin", payload).await.unwrap();
+
+    // Rot chunk 0 (owned by node 0) by flipping a body byte. Trailer bytes
+    // live at the end; we touch byte 0 to be sure we're inside the body.
+    let port0 = ouroboros_fs::node::port_str(&ring.nodes[0].node.port).to_string();
+    let chunk0 = ring.nodes[0]
+        .node
+        .storage_root
+        .join(&port0)
+        .join("content")
+        .join("rot.bin.part-001-of-003");
+    let mut bytes = tokio::fs::read(&chunk0).await.unwrap();
+    assert!(
+        bytes.len() > 32,
+        "expected body+trailer; got {} bytes",
+        bytes.len()
+    );
+    bytes[0] ^= 0xFF;
+    tokio::fs::write(&chunk0, &bytes).await.unwrap();
+
+    // Pull from node 1 so the puller has to fetch chunk 0 from node 0
+    // (which serves size=0) and then recover from the predecessor backup.
+    let got = pull_bytes(ring.addr(1), "rot.bin").await.unwrap();
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "expected full body via backup fall-through; got {} bytes",
+        got.len()
+    );
+    assert_eq!(
+        sha256(&got),
+        sha256(payload),
+        "expected backup fall-through to recover original bytes"
+    );
+
+    shutdown(ring).await;
+}

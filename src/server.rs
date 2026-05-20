@@ -721,14 +721,25 @@ async fn handle_netmap_get<W: AsyncWrite + Unpin>(
 
 // --- FILE CHUNKING helpers
 
-/// Write a chunk's bytes to `<dir>/<final_name>` with crash safety.
+/// Length of the SHA-256 trailer appended to every saved chunk.
+const CHUNK_TRAILER_LEN: u64 = 32;
+
+/// Write a chunk's bytes to `<dir>/<final_name>` with crash safety and
+/// per-chunk integrity checking.
 ///
-/// 1. Copy exactly `size` bytes from `reader` into `<dir>/<final_name>.partial`.
-/// 2. `sync_all()` the file if `mode >= Data`.
-/// 3. `rename(2)` to `<dir>/<final_name>`. POSIX rename is atomic within a
+/// On-disk layout: `<body bytes> || sha256(body)` (32 trailing bytes).
+/// The body length is `metadata.len() - CHUNK_TRAILER_LEN`; readers split
+/// the trailer back off and verify before serving (see `open_chunk_verified`).
+///
+/// Crash safety:
+/// 1. Copy exactly `size` bytes from `reader` into `<dir>/<final_name>.partial`,
+///    hashing in-stream.
+/// 2. Append the 32-byte hash trailer.
+/// 3. `sync_all()` the file if `mode >= Data`.
+/// 4. `rename(2)` to `<dir>/<final_name>`. POSIX rename is atomic within a
 ///    directory, so a crash either leaves the `.partial` (cleaned by the
 ///    startup janitor) or leaves the final file intact.
-/// 4. `sync_all()` the directory file descriptor if `mode == Full`, so the
+/// 5. `sync_all()` the directory file descriptor if `mode == Full`, so the
 ///    directory entry survives a power loss between rename and OS writeback.
 ///
 /// Returns the body length actually copied (matches `size` on success).
@@ -739,16 +750,37 @@ async fn durably_write_chunk<R: AsyncRead + Unpin>(
     size: u64,
     mode: FsyncMode,
 ) -> std::io::Result<u64> {
+    use sha2::{Digest, Sha256};
+
     let final_path = dir.join(final_name);
     let partial_path = dir.join(format!("{final_name}.partial"));
 
     let mut written = 0u64;
     {
         let mut f = tokio::fs::File::create(&partial_path).await?;
+        let mut hasher = Sha256::new();
         if size > 0 {
-            let mut limited = reader.take(size);
-            written = tokio::io::copy(&mut limited, &mut f).await?;
+            // Stream in 64 KiB blocks; hash + write each block in lockstep so
+            // we never hold more than the block size in RAM.
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut remaining = size;
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = reader.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short read on chunk body",
+                    ));
+                }
+                hasher.update(&buf[..n]);
+                f.write_all(&buf[..n]).await?;
+                remaining -= n as u64;
+                written += n as u64;
+            }
         }
+        let digest = hasher.finalize();
+        f.write_all(&digest).await?;
         f.flush().await?;
         if mode.syncs_file() {
             f.sync_all().await?;
@@ -768,6 +800,36 @@ async fn durably_write_chunk<R: AsyncRead + Unpin>(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
     }
     Ok(written)
+}
+
+/// Open a chunk, read it in full, verify its SHA-256 trailer, and return the
+/// body bytes (without the trailer).
+///
+/// Returns `Err` on missing-file (`NotFound`), short file (anything smaller
+/// than the trailer length is corrupt by definition), or hash mismatch
+/// (`InvalidData`). Callers decide whether to fall through to a backup.
+async fn open_chunk_verified(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = tokio::fs::read(path).await?;
+    if (bytes.len() as u64) < CHUNK_TRAILER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk shorter than trailer",
+        ));
+    }
+    let split = bytes.len() - CHUNK_TRAILER_LEN as usize;
+    let (body, trailer) = bytes.split_at(split);
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let actual = hasher.finalize();
+    if actual.as_slice() != trailer {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk hash mismatch",
+        ));
+    }
+    Ok(body.to_vec())
 }
 
 fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
@@ -1086,26 +1148,37 @@ async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
         .join("content")
         .join(&name);
 
-    // Stream the chunk straight from disk to the wire (no full-chunk Vec).
-    // Open first so the metadata().len() we announce matches the bytes we
-    // ship, even if a concurrent process were to truncate the file —
-    // chunks here are immutable in practice, but this is the natural
-    // pattern.
-    let mut f = match tokio::fs::File::open(&chunk_path).await {
-        Ok(f) => f,
-        Err(_) => {
+    // Read the chunk in full and verify the SHA-256 trailer before announcing
+    // any bytes to the puller.
+    //
+    // Missing file → announce size=0 (the long-standing convention; some
+    // PULL paths legitimately receive a missing-chunk response, e.g. during
+    // a heal window).
+    //
+    // Corrupt file → return Err so `handle_client` drops the connection.
+    // The puller's `request_chunk_from` returns Err on the unexpected EOF,
+    // which triggers the predecessor-backup fall-through path. We can't use
+    // size=0 here: that's ambiguous with "this chunk is legitimately empty,"
+    // which happens for small files where `fair_chunk_len(i) == 0`, and
+    // the puller treats size=0 as success (no fall-through).
+    let body = match open_chunk_verified(&chunk_path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             writer
                 .write_all(format!("FILE RESP-CHUNK {} 0 {}\n", next, name).as_bytes())
                 .await?;
             return Ok(());
         }
+        Err(e) => {
+            tracing::error!(node = %node.port, chunk = %name, error = ?e, "Chunk failed integrity check; dropping connection so the puller falls through to backup.");
+            return Err(format!("chunk {name} failed integrity check: {e}").into());
+        }
     };
-    let len = f.metadata().await?.len();
     writer
-        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, len, name).as_bytes())
+        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, body.len(), name).as_bytes())
         .await?;
-    if len > 0 {
-        copy(&mut f, writer).await?;
+    if !body.is_empty() {
+        writer.write_all(&body).await?;
     }
     Ok(())
 }
@@ -1164,22 +1237,29 @@ async fn handle_file_get_backup_chunk<W: AsyncWrite + Unpin>(
         .join("backup")
         .join(&name);
 
-    // Same streaming pattern as GET-CHUNK, against the /backup dir.
-    let mut f = match tokio::fs::File::open(&chunk_path).await {
-        Ok(f) => f,
-        Err(_) => {
+    // Same read-and-verify pattern as GET-CHUNK, against /backup. Missing
+    // → size=0; corrupt → return Err so `handle_client` drops the
+    // connection (no further fall-through is available — the file is
+    // permanently lost, but at least we don't return body bytes whose
+    // trailer didn't verify).
+    let body = match open_chunk_verified(&chunk_path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             writer
                 .write_all(format!("FILE RESP-CHUNK {} 0 {}\n", next, name).as_bytes())
                 .await?;
             return Ok(());
         }
+        Err(e) => {
+            tracing::error!(node = %node.port, chunk = %name, error = ?e, "Backup chunk failed integrity check; no further fall-through available.");
+            return Err(format!("backup chunk {name} failed integrity check: {e}").into());
+        }
     };
-    let len = f.metadata().await?.len();
     writer
-        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, len, name).as_bytes())
+        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, body.len(), name).as_bytes())
         .await?;
-    if len > 0 {
-        copy(&mut f, writer).await?;
+    if !body.is_empty() {
+        writer.write_all(&body).await?;
     }
     Ok(())
 }
@@ -1527,20 +1607,17 @@ async fn push_to_predecessor(node: Arc<Node>, chunk_name: String) {
         .join("content")
         .join(&chunk_name);
 
-    let mut f = match tokio::fs::File::open(&src_path).await {
-        Ok(f) => f,
+    // Open + verify our local copy, then ship the body (without our own
+    // trailer) to the predecessor. The receiver re-hashes and writes its
+    // own trailer; the two copies are independent integrity-checked stores.
+    let body = match open_chunk_verified(&src_path).await {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!(node = %node.port, chunk = %chunk_name, error = ?e, "Source chunk missing; cannot push backup.");
+            tracing::warn!(node = %node.port, chunk = %chunk_name, error = ?e, "Source chunk missing or corrupt; cannot push backup.");
             return;
         }
     };
-    let size = match f.metadata().await {
-        Ok(m) => m.len(),
-        Err(e) => {
-            tracing::warn!(node = %node.port, chunk = %chunk_name, error = ?e, "Could not stat source chunk; skipping backup push.");
-            return;
-        }
-    };
+    let size = body.len() as u64;
 
     let mut s = match TcpStream::connect(&pred_addr).await {
         Ok(s) => s,
@@ -1555,11 +1632,11 @@ async fn push_to_predecessor(node: Arc<Node>, chunk_name: String) {
         tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Failed to send BACKUP-PUSH header.");
         return;
     }
-    if size > 0 {
-        if let Err(e) = copy(&mut f, &mut s).await {
-            tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Failed to stream backup chunk body.");
-            return;
-        }
+    if size > 0
+        && let Err(e) = s.write_all(&body).await
+    {
+        tracing::warn!(node = %node.port, predecessor = %pred_addr, chunk = %chunk_name, error = ?e, "Failed to stream backup chunk body.");
+        return;
     }
     let _ = s.shutdown().await;
 
