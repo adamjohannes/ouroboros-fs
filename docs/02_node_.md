@@ -42,15 +42,23 @@ pub struct Node {
     pub file_tags: RwLock<HashMap<String, FileTag>>,
 
     /// Filesystem root under which `<port>/content/` and `<port>/backup/` live.
-    /// The binary uses `PathBuf::from("nodes")`; tests pass a tempdir so
-    /// concurrent suites don't collide on disk.
     pub storage_root: PathBuf,
 
-    // ... other state for managing the network ...
+    /// Pre-shared key for the wire-protocol AUTH handshake
+    /// (disabled in development, required in production).
+    pub auth_token: AuthToken,
+
+    /// Per-chunk durability policy and connection caps.
+    pub fsync_mode: FsyncMode,
+    pub idle_timeout: Duration,
+    pub max_conns: u32,
+
+    // ... plus per-node Prometheus counters and other state.
+    // See `src/node.rs` for the full struct.
 }
 ```
 
-This is a very simple blueprint:
+The simplified blueprint above shows the v1.0 surface most relevant to readers:
 *   `port`: This is the Node's own address. It's how others can find and talk to it.
 *   `next_port`: This is the most crucial part for forming the ring. It holds the address of the next Node in the circle. If this isn't set, the Node is isolated.
 *   `file_tags`: This is the Node's "card catalog" or index. It keeps track of *every file* in the system, not just its own. It knows which Node started storing a file and how many pieces it was split into.
@@ -63,34 +71,27 @@ Every running Node starts a server that listens for incoming TCP connections. Th
 
 **File:** `src/server.rs`
 ```rust
+// Conceptual sketch — the real signatures take additional knobs
+// (auth_token, fsync_mode, idle_timeout, max_conns, …). See
+// `src/server.rs::bind`, `serve`, and `run` for the current surface.
+
 pub async fn bind(
     bind_addr: &str,
     gossip_interval: Duration,
-    file_size: u64,
-    storage_root: PathBuf,
-    respawn_dead: bool,
+    /* …knobs… */
 ) -> Result<(Arc<Node>, TcpListener, SocketAddr), AnyErr> {
-    // ... bind the socket, create node, mkdir storage_root/<port>/{content,backup} ...
+    // Bind the socket, create the Node, mkdir
+    // <storage_root>/<port>/{content,backup}, write the
+    // VERSION marker, sweep orphan *.partial files, then return.
 }
 
 pub async fn serve(node: Arc<Node>, listener: TcpListener) {
     // Spawn the gossip loop, then accept connections forever.
-    loop {
-        let (stream, peer) = listener.accept().await.expect("accept");
-        let node = Arc::clone(&node);
-        tokio::spawn(async move { handle_client(node, stream).await; });
-    }
+    // (For graceful shutdown, see `serve_with_shutdown`.)
 }
 
-pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64)
-    -> Result<(), AnyErr>
-{
-    let (node, listener, _) = bind(
-        bind_addr, gossip_interval, file_size,
-        PathBuf::from("nodes"), /*respawn_dead=*/ true,
-    ).await?;
-    serve(node, listener).await;
-    Ok(())
+pub async fn run(/* …knobs… */) -> Result<(), AnyErr> {
+    // bind + wire SIGTERM/SIGINT handler + serve_with_shutdown.
 }
 ```
 This is the main loop for any Node. `bind` returns the resolved `SocketAddr`, which is what lets the

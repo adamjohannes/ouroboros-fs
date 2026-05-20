@@ -173,6 +173,31 @@ a clear error message — it will not silently corrupt your data.
 
 For the v1.0-rc → v1.0 final transition, no migration is required.
 
+### Upgrading from a pre-marker tree
+
+The `STORAGE_VERSION` marker landed in v1.0-rc.1. If you ran an
+earlier rc against a tree that was already v1-format (i.e., chunks
+already carry the SHA-256 trailer from Series B) but doesn't yet have
+a `VERSION` file, `bind` refuses to start with `unversioned storage
+tree at <path> contains chunks; …`.
+
+To assert that the tree is genuinely v1 and let `bind` write the
+marker over it, set `OUROBOROS_FORCE_V1=1` in the environment for one
+boot:
+
+```bash
+OUROBOROS_FORCE_V1=1 systemctl restart ouroboros-node@7000
+# Verify the marker is now in place:
+cat /var/lib/ouroboros/7000/VERSION   # → "1"
+# Unset OUROBOROS_FORCE_V1 from the environment going forward.
+```
+
+If you're not sure whether the tree is v1, the safer path is to wipe
+`<storage_root>` and let the heal flow refill from the cluster's other
+copies. Setting `OUROBOROS_FORCE_V1` against a pre-Series-B tree
+(chunks without the trailer) will cause every PULL to fall through
+to the predecessor's backup forever.
+
 ## Log analysis
 
 Production deployments should set `--log-format json` so logs go

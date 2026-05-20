@@ -6,6 +6,14 @@ Throughout this entire tutorial, we've talked about commands like `TOPOLOGY WALK
 
 This is where the **Command Protocol** comes in. It's the simple, shared language of OuroborosFS.
 
+> **When auth is enabled** (production), every connection's first line
+> must be the AUTH handshake — `AUTH <hmac_hex> <nonce_hex>`, where the
+> HMAC is `HMAC-SHA256(secret, nonce)` over a fresh 16-byte nonce.
+> Without it, the node closes the connection with `ERR auth required`
+> within 1 s. The snippets in this chapter show the disabled-auth flow
+> for clarity; see [`SECURITY.md`](SECURITY.md) and `src/auth.rs` for
+> how to construct the AUTH line.
+
 ## What Problem Does This Solve?
 
 In any distributed system, the components need a standardized way to communicate. They need to agree on a set of rules for how to ask for things and how to respond. Without a shared language, it would be chaos.

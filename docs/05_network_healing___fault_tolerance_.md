@@ -64,12 +64,13 @@ This function is very straightforward. It tries to connect to the neighbor, send
 
 **File:** `src/server.rs`
 ```rust
-async fn check_node_health(_node: Arc<Node>, addr: &str) -> Result<(), AnyErr> {
+async fn check_node_health(node: Arc<Node>, addr: &str) -> Result<(), AnyErr> {
     // We'll only wait 2 seconds for the whole conversation.
     let timeout = Duration::from_secs(2);
 
-    // Connect, send, and read, all with a timeout.
+    // Connect, AUTH (no-op when disabled), PING, read PONG — all with a timeout.
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr)).await??;
+    send_auth(&mut stream, &node.auth_token).await?;
     stream.write_all(b"NODE PING\n").await?;
 
     let mut reader = BufReader::new(stream);
@@ -121,7 +122,7 @@ This process ensures that a dead [Node](02_node_.md) is not just replaced, but i
 
 ## Under the Hood: The Healing Workflow in Code
 
-Let's look at a simplified version of the `handle_node_death` function, broken down into its four key jobs.
+Let's look at a simplified version of the `handle_node_death` function, broken down into its five key jobs.
 
 **File:** `src/server.rs`
 
@@ -157,16 +158,22 @@ Next, the healer [Node](02_node_.md) acts like an operator and starts a brand ne
     }
 
     let exe = current_exe()?;
-    Command::new(exe)
-        .arg("run")
+    let mut cmd = Command::new(exe);
+    cmd.arg("run")
         .arg("--addr").arg(&dead_addr)
         .arg("--wait-time").arg(node.gossip_interval.as_millis().to_string())
-        .spawn()?;
+        .arg("--storage-root").arg(&node.storage_root); // §1.5: respawn inherits the on-disk tree
+    cmd.env_clear();                                    // §2.7: don't leak parent env
+    if let Some(bearer) = node.auth_token.bearer_value() {
+        cmd.env("OUROBOROS_AUTH_TOKEN", bearer);        // §C: rejoin auth-enabled ring
+    }
+    // (PATH, RUST_LOG also passed through — see src/server.rs.)
+    cmd.spawn()?;
 ```
-This is just like you typing `ouroboros_fs run --addr 127.0.0.1:7002 --wait-time 5000` in your
-terminal. The system is programmatically running itself. The `respawn_dead` gate is the only
-production-relevant change to this code path — without it, the in-process integration test harness
-couldn't simulate failures.
+This is just like you typing `ouroboros_fs run --addr 127.0.0.1:7002 --storage-root … --wait-time 5000`
+in your terminal. The `--storage-root` arg is what lets a respawned node serve the chunks the dead
+process was holding (without it, the new process would compute `nodes/` relative to its own cwd and
+the on-disk tree would orphan).
 
 ### 3. Welcome the Newcomer
 
@@ -182,6 +189,14 @@ The newly spawned [Node](02_node_.md) is a blank slate. It knows nothing about t
     share_data_with_new_node(&node, &dead_addr).await?;
 ```
 The `share_data_with_new_node` function connects to the new [Node](02_node_.md) and sends a series of `SET` commands (`TOPOLOGY SET`, `NETMAP SET`, `FILE TAGS-SET`) to populate its internal state.
+
+Right after the metadata is shared, the healer also performs an
+**anti-entropy refill**: it walks its own `backup/` directory and pushes
+every chunk back to the respawned node's `content/` via `FILE
+CONTENT-PUSH`. This recovers the disk-loss case (the respawned node's
+`<storage_root>` was wiped between the kill and the respawn) — without
+it, every PULL for chunks the dead node owned would have to fall through
+to a backup forever.
 
 ### 4. Announce the Recovery
 
@@ -206,11 +221,12 @@ You've just learned about OuroborosFS's powerful self-healing capabilities.
 
 *   **Gossip Protocol:** [Nodes](02_node_.md) constantly check on their neighbors using a `PING`/`PONG` health check.
 *   **Failure Detection:** If a neighbor fails to respond, it's considered "dead."
-*   **Automated Healing:** The detecting [Node](02_node_.md) triggers a robust, four-step process to replace the dead [Node](02_node_.md).
+*   **Automated Healing:** The detecting [Node](02_node_.md) triggers a robust, five-step process to replace the dead [Node](02_node_.md).
     1.  Announce the death.
-    2.  Respawn a new process.
-    3.  Sync the new process with network data.
-    4.  Announce the recovery.
+    2.  Respawn a new process (inheriting `--storage-root` and the auth token).
+    3.  Sync the new process with network metadata (`NETMAP/TOPOLOGY/FILE TAGS`).
+    4.  Anti-entropy refill: push the predecessor's `backup/` chunks into the respawned node's `content/`.
+    5.  Announce the recovery.
 
 This fault tolerance makes OuroborosFS a resilient system that can withstand unexpected failures.
 

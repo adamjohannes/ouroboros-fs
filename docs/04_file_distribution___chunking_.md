@@ -83,6 +83,9 @@ When Node A receives the `FILE PUSH` command, its handler springs into action.
 
 **File:** `src/server.rs`
 ```rust
+// Conceptual sketch — see `src/server.rs::handle_file_push` for the
+// current code (auth check, validated filenames, fsync mode, etc.).
+
 async fn handle_file_push(/*...*/) -> Result<(), AnyErr> {
     // 1. Determine how many chunks to create.
     let parts: u32 = node.network_size().await as u32;
@@ -90,41 +93,25 @@ async fn handle_file_push(/*...*/) -> Result<(), AnyErr> {
     // 2. Walk the topology snapshot to find each chunk's owner.
     //    Chunk 0 stays here; chunks 1..parts-1 go to subsequent nodes.
     let topology = node.topology_map.read().await.clone();
-    let mut target_addrs = Vec::with_capacity(parts as usize - 1);
     /* ... walk topology starting from this node's port ... */
 
-    // 3. Open all outbound connections in parallel and send PUSH-CHUNK headers.
-    let mut conns = futures::future::try_join_all(
-        target_addrs.iter().map(|addr| TcpStream::connect(addr))
-    ).await?;
-    for (i, s) in conns.iter_mut().enumerate() {
-        let index = (i + 1) as u32;
-        let chunk_size = fair_chunk_len(index, size, parts);
-        let header = format!(
-            "FILE PUSH-CHUNK {} {} {} {} {} {}\n",
-            chunk_file_name(&name, index, parts),
-            chunk_size, size, parts, index, start_port_num,
-        );
-        s.write_all(header.as_bytes()).await?;
-    }
+    // 3. Open all outbound connections in parallel and send PUSH-CHUNK
+    //    headers. Each outbound also sends the AUTH line first when
+    //    a token is configured.
 
-    // 4. Stream chunk 0 to disk locally; forward chunks 1..parts-1 to their conns.
-    let len0 = fair_chunk_len(0, size, parts);
-    let mut local = tokio::fs::File::create(&chunk0_path).await?;
-    tokio::io::copy(&mut reader.take(len0), &mut local).await?;
-    for (i, s) in conns.iter_mut().enumerate() {
-        let chunk_size = fair_chunk_len((i + 1) as u32, size, parts);
-        tokio::io::copy(&mut reader.take(chunk_size), s).await?;
-    }
+    // 4. Stream chunk 0 to disk via `durably_write_chunk` (writes to
+    //    `<chunk>.partial`, appends a SHA-256 trailer, rename(2)s atomically,
+    //    then optionally fsyncs the file and parent directory). Forward
+    //    chunks 1..parts-1 to their already-open conns.
 
-    // 5. Await OK from every backend.
-    for s in conns.iter_mut() { /* read_line, check OK, time-bounded */ }
-    // ... respond OK to the client ...
+    // 5. Await OK from every backend, then OK the client.
 }
 ```
 The crucial difference from a chain-relay design: bytes from the client flow through the start node
-*once*, but the writes go to multiple destinations in parallel. The start node never buffers a whole
-chunk — `tokio::io::copy` uses an 8 KiB internal buffer regardless of chunk size.
+*once*, but the writes go to multiple destinations in parallel. The on-disk layout for every saved
+chunk is `body || sha256(body)`; readers verify the trailer before serving and fall through to a
+predecessor's `backup/` on mismatch. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for the full
+durability path.
 
 #### What is `fair_chunk_len`?
 
@@ -149,19 +136,22 @@ forwarding — every chunk is sent directly by the start node.
 
 **File:** `src/server.rs`
 ```rust
+// Conceptual sketch — see `src/server.rs::handle_file_push_chunk` for
+// the current code.
+
 async fn handle_file_push_chunk(/*...*/) -> Result<(), AnyErr> {
-    // 1. Tag the file locally so this node knows about it for FILE LIST and FILE PULL.
+    // 1. Tag the file locally so this node knows about it for FILE LIST
+    //    and FILE PULL.
     let parent_name = name
         .rsplit_once(".part-")
         .map(|(p, _)| p.to_string())
         .unwrap_or_else(|| name.clone());
     node.set_file_tag(&parent_name, start_port, file_size, parts).await;
 
-    // 2. Stream exactly chunk_size bytes from the connection straight to disk.
-    let path = node.storage_root.join(port_str(&node.port)).join("content").join(&name);
-    let mut file = tokio::fs::File::create(&path).await?;
-    tokio::io::copy(&mut reader.take(chunk_size), &mut file).await?;
-    file.flush().await?;
+    // 2. Stream exactly chunk_size bytes from the connection straight
+    //    to disk via `durably_write_chunk` — atomic write-then-rename
+    //    with an appended SHA-256 trailer.
+    durably_write_chunk(&content_dir, &name, reader, chunk_size, fsync_mode).await?;
 
     // 3. Spawn a fire-and-forget backup push to our predecessor (see Chapter 5).
     tokio::spawn(push_to_predecessor(Arc::clone(&node), name.clone()));
@@ -171,10 +161,12 @@ async fn handle_file_push_chunk(/*...*/) -> Result<(), AnyErr> {
     Ok(())
 }
 ```
-The receiver never holds a chunk in a `Vec<u8>` — `tokio::io::copy` uses a fixed 8 KiB internal
-buffer, so per-node memory during a push is bounded by that buffer plus whatever filesystem
-write-back the OS holds. This matters when files are large: a 1 GB push across 5 nodes used to peak
-at hundreds of MB resident on each relay; now relay nodes idle around 4 MB.
+The receiver streams in 64 KiB blocks (the hasher and writer share the
+same loop), so per-node memory during a push is bounded by that block
+size plus whatever filesystem write-back the OS holds. The PULL read
+path is different: `open_chunk_verified` loads the whole chunk into a
+`Vec` to compare against the stored SHA trailer, so a node serving a
+PULL needs `chunk_size` headroom in RAM.
 
 ## Keeping Track: The `FileTag`
 

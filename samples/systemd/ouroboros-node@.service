@@ -10,9 +10,12 @@
 #                            ouroboros-node@7001 \
 #                            ouroboros-node@7002
 #
-# Then wire the ring once (NODE NEXT). The gateway's TCP-proxy mode
-# (samples/systemd/ouroboros-gateway.service) handles the wiring; or
-# do it manually with `nc` or the test harness.
+# Then wire the ring once (NODE NEXT). Either bring up `dev-network`
+# briefly with the same auth token + ports and let it wire the ring
+# (then Ctrl-C it; the wiring persists in each node's process state),
+# or send `NODE NEXT` lines manually with `nc` after authenticating.
+# The standalone gateway subcommand does NOT auto-wire the ring — it
+# only proxies client requests.
 #
 # Auth token: set OUROBOROS_AUTH_TOKEN in /etc/default/ouroboros (or
 # wherever you prefer). The unit reads it via EnvironmentFile=.

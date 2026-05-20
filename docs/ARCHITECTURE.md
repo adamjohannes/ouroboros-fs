@@ -145,8 +145,6 @@ detector       dead node       respawned       predecessor of dead
   │   (after gossip_interval)     │
   │                               │
   │── exec --addr <dead_addr> ─────▶ (fresh process)
-  │                                  ├ writes VERSION marker
-  │                                  └ sweeps *.partial orphans
   │                               │
   │── share NETMAP/TOPOLOGY/  ────▶│
   │   FILE TAGS/NODE NEXT          │
@@ -156,6 +154,10 @@ detector       dead node       respawned       predecessor of dead
   │                               │
   │── broadcast NETMAP SET (Alive)
 ```
+
+(The respawned process's `bind()` writes the `VERSION` marker and
+sweeps any orphan `*.partial` files just like a fresh boot — those
+steps aren't heal-specific; they happen on every node startup.)
 
 The detector is the **predecessor** of the dead node (the one
 gossipping `NODE PING` at it). After respawn, that same predecessor

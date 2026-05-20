@@ -74,10 +74,13 @@ First release candidate. Closes every P0 and P1 item from
 
 ### Changed
 
-- **`Node` `Debug` impl is now manual and redacts** sensitive
-  fields (storage_root, file_tags, network_nodes, topology,
-  auth_token). Prevents future `tracing::error!(?node, ...)`
-  log leaks. (Series J)
+- **`Node` `Debug` impl is now manual.** Sensitive fields
+  (`storage_root`, `file_tags`, `network_nodes`, `topology_map`,
+  `pending_walks`, `pending_heals`) are *omitted* via
+  `finish_non_exhaustive()`. `auth_token` is still emitted, but its
+  own `Debug` impl prints `AuthToken(<redacted>)` so the secret
+  doesn't leak. Prevents future `tracing::error!(?node, ...)` from
+  dumping the full state. (Series J)
 - **`set-network` renamed to `dev-network`** with deprecated alias.
   (Series H)
 - **`POST /node/<port>/kill` removed** entirely from the gateway —
@@ -125,10 +128,12 @@ v1.0 is:
 - `ouroboros_fs::AuthToken`, `FsyncMode`, `NodeStatus`.
 - The wire protocol (`docs/01-06`, `docs/ARCHITECTURE.md`).
 
-`bind`, `serve`, `serve_with_shutdown`, and the `Node` struct are
-re-exported under `#[doc(hidden)]` for the in-process test harness.
-They're not stable across patch releases; library users should
-treat them as internal.
+`bind`, `serve`, and `serve_with_shutdown` are re-exported under
+`#[doc(hidden)]` (see `src/lib.rs:15`) for the in-process test
+harness; they're not stable across patch releases. `Node` is
+re-exported normally (it's part of the public surface so users can
+read its fields), but its layout is not stable across major versions
+— treat it as opaque except for documented accessors.
 
 ## [0.1.0] — Pre-1.0 history
 

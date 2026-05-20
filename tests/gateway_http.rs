@@ -417,19 +417,13 @@ async fn gateway_connect_to_ring_all_dead_returns_500() {
 
 // ---------- TCP proxy passthrough ----------
 //
-// **Documented limitation:** the gateway's `handle_tcp_proxy` uses
-// `try_join!(client→server, server→client)` of two `tokio::io::copy`
-// halves. Both halves only return on EOF of their reader, which means
-// the connection is held open until the *upstream ring node* closes its
-// write half — and the ring's `handle_client` loop never closes proactively;
-// it only closes when the client's write half is shut down, which the
-// gateway only does after `try_join!` finishes. Net result: any TCP-proxy
-// session that doesn't trigger an explicit ring-side close (which is most
-// of them) deadlocks until the OS-level TCP keepalive eventually tears it
-// down.
-//
-// These tests pin the deadlock by `#[ignore]`ing them. Run them after a
-// fix to the proxy with `cargo test gateway_tcp_proxy -- --ignored`.
+// Series I (commit `a9066ec`) fixed the original `try_join!` deadlock
+// in `handle_tcp_proxy`: the gateway now explicitly shuts down its
+// `node_write` half after the client's request copy completes, so the
+// ring sees a clean EOF and exits its read loop. These two tests cover
+// the single-shot (NODE STATUS) and streaming (FILE PUSH/PULL)
+// paths through the proxy; they were `#[ignore]`d while the deadlock
+// stood.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_tcp_proxy_passes_through_node_status() {

@@ -147,7 +147,9 @@ The network actively monitors and heals itself.
 
 ### 2.4. Gateway Service (TCP Proxy & HTTP API)
 
-You can optionally run a gateway service using the `--dns-port` flag when running `set-network`. This service acts as a
+You can optionally run a gateway service. The development helper `dev-network --dns-port 8000`
+spins up a ring + integrated gateway in a single process; production deployments use the
+standalone `gateway` subcommand (see §3.3 "Production deploy"). Either way, the gateway acts as a
 simple, stateless proxy and single entry point for the network.
 
 When a client connects, the gateway "sniffs" the first line of the request to determine its type:
@@ -159,13 +161,18 @@ When a client connects, the gateway "sniffs" the first line of the request to de
     - `GET /file/pull/<name>`: Streams the raw file bytes for download.
     - `POST /file/push`: Accepts raw file bytes (as `application/octet-stream`) to push a new file to the network.
     - `POST /network/heal`: Triggers a manual, ring-wide network heal.
-    - `POST /node/<port>/kill`: Sends a kill signal to a specific node process.
+    - `GET /metrics`: Prometheus text-format metrics aggregated across ring nodes.
+    - `GET /health` / `GET /ready`: Liveness and readiness probes (auth-bypassing, for orchestrators).
 * **TCP Proxy:** If the request is not HTTP, the gateway assumes it's a text-based protocol command (like
   `FILE PUSH ...`). It checks its internal, cached list of healthy nodes, finds one that is `Alive`, and transparently
   proxies the entire TCP connection to that node.
 
 This provides a single, stable entry point for the network, so clients don't need to know the address of any specific
 node.
+
+When auth is enabled (production), every HTTP request except `OPTIONS`, `/health`, and `/ready` requires
+`Authorization: Bearer <hex-token>`, and every TCP-proxy connection requires the wire-protocol AUTH line first.
+See [`docs/SECURITY.md`](docs/SECURITY.md) for details.
 
 ---
 
@@ -187,22 +194,34 @@ cargo build --release
 
 ### 3.3. Run a Network
 
-The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you. The
+> [!NOTE]
+> The recipe below runs in **disabled-auth mode**: no `--auth-token` and no
+> `OUROBOROS_AUTH_TOKEN`. The bundled `scripts/*.sh` helpers and the Vue
+> dashboard talk to the ring without sending an AUTH line, so they only
+> work in this mode. For production deploys with the wire-protocol AUTH
+> handshake and HTTP bearer auth enabled, see
+> [`docs/operations.md`](docs/operations.md) and the standalone `gateway`
+> subcommand instead.
+
+The easiest way to start is using the `dev-network` subcommand, which spawns and wires up a ring for you. The
 `--dns-port` flag starts the gateway, which provides both the TCP proxy and the HTTP API.
 
 ```bash
 # This will start 5 nodes (7000-7004) AND a gateway service on port 8000
 # The gateway will provide the HTTP API on http://127.0.0.1:8000
 # and also act as a TCP proxy on the same port.
-cargo run --release -- set-network \
+cargo run --release -- dev-network \
     --nodes 5 \
     --base-port 7000 \
     --dns-port 8000
 ```
 
+> The legacy name `set-network` is still accepted as a clap alias for one
+> release; new scripts should use `dev-network`.
+
 This command will block, holding the network open.
 
-`set-network` also accepts `--file-size <bytes>` (default `1_000_000_000`, i.e., 1 GB) which caps the
+`dev-network` also accepts `--file-size <bytes>` (default `1_000_000_000`, i.e., 1 GB) which caps the
 maximum size of a single accepted file per node. Pass `0` to disable the cap. The same flag exists on
 the `run` subcommand if you start nodes individually.
 
@@ -210,6 +229,21 @@ Each node persists its chunks under `<storage_root>/<port>/content/` and backups
 `<storage_root>/<port>/backup/`. The `run` subcommand defaults `--storage-root` to `nodes/`
 relative to the working directory; tests pass a `TempDir`. For production deployments and
 cluster-backup procedure, see [docs/operations.md](docs/operations.md).
+
+#### Production deploy
+
+`dev-network` is for local development. In production, run each ring node as its own service
+(`ouroboros_fs run`) and the gateway as a separate service (`ouroboros_fs gateway --listen ...
+--node ...`). Sample systemd unit files and a quick-start are in
+[`samples/systemd/`](samples/systemd/); the [operator's guide](docs/operations.md) walks the
+full procedure.
+
+#### Configuration
+
+Both `run` and `gateway` accept `--config <path>` (TOML). CLI flags override config-file values,
+which override built-in defaults. Sample configs in [`samples/config/`](samples/config/).
+Both subcommands also support `--log-format {text,json}`; production deployments should use
+`json` so structured `tracing` events ship straight into Splunk/ELK/Datadog.
 
 ### 3.4. Run the Web Dashboard (Optional)
 
@@ -260,7 +294,7 @@ the **gateway service** (e.g., on port 8000), you can point all scripts to that 
 # Kill a specific node by port
 ./scripts/kill_node.sh 7002
 
-# Kill every node spawned by set-network
+# Kill every node spawned by dev-network
 ./scripts/kill_all_nodes.sh
 
 # List node processes (lsof against the configured ports)
@@ -307,6 +341,12 @@ Commands follow a `<NOUN> <VERB> [params...]` structure.
 ### 4.1. Client Commands
 
 These are the primary commands you would send to a node (or the gateway) via `netcat`.
+
+> [!NOTE]
+> When auth is enabled, every connection's first line must be the AUTH
+> handshake (`AUTH <hmac_hex> <nonce_hex>`). The commands below assume a
+> disabled-auth ring or that AUTH has already been sent. See
+> [`docs/SECURITY.md`](docs/SECURITY.md) for the construction.
 
 - **`NODE NEXT <addr>`**: Sets the next hop for a node to form the ring.
 - **`NODE STATUS`**: Asks a node for its port and configured next hop.
@@ -371,23 +411,19 @@ push and pull-request to `main` and uploads `lcov.info` as a build artifact name
 will be added in a follow-up once a measured baseline exists.
 
 A separate `pr_full_tests` job runs **only on pull-requests targeting `main`**. It runs the default
-suite plus the unstuck `#[ignore]`d tests (`heal_subprocess::full_heal_*` and
+suite plus the unstuck `#[ignore]`d tests (`heal_subprocess::full_heal_*`,
+`respawn_inherits_storage_root`, `anti_entropy_refills_content_after_respawn`, and
 `large_file_streaming_100mb`) so PR authors get a regression signal on the slow paths the
-default-on-push suite skips. The two `gateway_tcp_proxy_*` ignored tests are deliberately not
-included — they're pinned to a known deadlock and would hang the job.
+default-on-push suite skips. (The TCP-proxy deadlock that previously kept
+`gateway_tcp_proxy_*` `#[ignore]`d was fixed in Series I; those tests now run on the default path.)
 
 ### Gaps reflected in the metric
 
 - `src/server.rs::handle_node_death` lines 1644-1685 (binary-respawn + `share_data_with_new_node`)
-  are reached only by the ignored `heal_subprocess::full_heal_respawns_dead_child_and_broadcasts`
-  test. The in-process integration harness sets `respawn_dead=false` so killing a node doesn't
-  exec a real binary that survives the test runtime.
-- `src/gateway.rs::trigger_node_kill` is Unix-specific (`lsof`/`kill`). The
-  `gateway_post_kill_unknown_port_returns_500` test covers the failure branch only; the success
-  branch isn't hit by the in-process suite.
-- `src/gateway.rs::handle_tcp_proxy` has a known deadlock with the current `try_join!` strategy
-  (see `tests/gateway_http.rs::gateway_tcp_proxy_*` — `#[ignore]`d). The two passthrough tests
-  are pinned for after the proxy fix.
+  are reached only by the ignored `heal_subprocess::full_heal_*` and
+  `respawn_inherits_storage_root` and
+  `anti_entropy_refills_content_after_respawn` tests. The in-process integration harness sets
+  `respawn_dead=false` so killing a node doesn't exec a real binary that survives the test runtime.
 
 [`cargo-llvm-cov`]: https://github.com/taiki-e/cargo-llvm-cov
 
