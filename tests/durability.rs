@@ -86,6 +86,8 @@ async fn bind_sweeps_orphan_partials() {
         false,
         FsyncMode::None,
         AuthToken::disabled(),
+        Duration::ZERO,
+        0,
     )
     .await
     .unwrap();
@@ -117,6 +119,8 @@ async fn bind_sweeps_orphan_partials() {
         false,
         FsyncMode::None,
         AuthToken::disabled(),
+        Duration::ZERO,
+        0,
     )
     .await
     .unwrap();

@@ -255,8 +255,11 @@ impl Gateway {
             )
         });
 
-        if content_length == 0 || filename.is_none() {
-            return Err("Missing Content-Length or X-Filename header".into());
+        let Some(filename) = filename else {
+            return Err("Missing X-Filename header".into());
+        };
+        if content_length == 0 {
+            return Err("Missing Content-Length header".into());
         }
 
         // Reject absurd Content-Length before allocating *or* opening a ring
@@ -270,7 +273,6 @@ impl Gateway {
             .into());
         }
 
-        let filename = filename.unwrap();
         let size = content_length;
 
         tracing::info!(file = %filename, bytes = size, "Receiving file from HTTP POST");

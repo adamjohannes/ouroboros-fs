@@ -68,6 +68,14 @@ enum Cmd {
         /// single-host development.
         #[arg(long)]
         auth_token: Option<String>,
+        /// Per-connection idle timeout in seconds. A client that holds
+        /// an open TCP connection without sending any bytes for this long
+        /// is dropped. 0 disables. Defaults to 60.
+        #[arg(long, default_value_t = 60u64)]
+        idle_timeout: u64,
+        /// Max concurrent client connections. 0 disables. Defaults to 1024.
+        #[arg(long, default_value_t = 1024u32)]
+        max_conns: u32,
     },
 
     /// Spawn N nodes and stitch them into a ring
@@ -121,6 +129,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             storage_root,
             fsync_mode,
             auth_token,
+            idle_timeout,
+            max_conns,
         } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
@@ -132,6 +142,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 storage_root,
                 fsync_mode.into(),
                 token,
+                Duration::from_secs(idle_timeout),
+                max_conns,
             )
             .await
         }

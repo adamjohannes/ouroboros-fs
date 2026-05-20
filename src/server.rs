@@ -35,6 +35,8 @@ pub async fn bind(
     respawn_dead: bool,
     fsync_mode: FsyncMode,
     auth_token: AuthToken,
+    idle_timeout: Duration,
+    max_conns: u32,
 ) -> Result<(Arc<Node>, TcpListener, std::net::SocketAddr), AnyErr> {
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
@@ -60,6 +62,8 @@ pub async fn bind(
         respawn_dead,
         fsync_mode,
         auth_token,
+        idle_timeout,
+        max_conns,
     );
     tracing::info!(node = %node.port, "Node listening");
 
@@ -121,6 +125,16 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
         });
     }
 
+    // Per-node concurrency cap. `max_conns == 0` disables it entirely
+    // (test default). Production default is 1024; saturated clients
+    // get `ERR server busy\n` and a prompt close instead of waiting in
+    // the kernel accept queue. (NEXT_STEPS.md §2.4.)
+    let conn_sem = if node.max_conns > 0 {
+        Some(Arc::new(tokio::sync::Semaphore::new(node.max_conns as usize)))
+    } else {
+        None
+    };
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -132,7 +146,27 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
         let node = Arc::clone(&node);
         let node_port = node.port.clone();
 
+        // Try to grab a connection slot. If saturated, briefly inform
+        // the client and drop. We use try_acquire (non-blocking) on
+        // purpose: queueing connections in this task would defeat the
+        // cap (it bounds in-flight handlers, not queued ones).
+        let permit = match &conn_sem {
+            None => None,
+            Some(sem) => match Arc::clone(sem).try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    tracing::warn!(node = %node_port, peer = %peer, "Refusing connection: max_conns saturated");
+                    let mut s = stream;
+                    let _ = s.write_all(b"ERR server busy\n").await;
+                    continue;
+                }
+            },
+        };
+
         tokio::spawn(async move {
+            // Hold the permit for the lifetime of the handler. Drop
+            // releases it back to the semaphore.
+            let _permit = permit;
             if let Err(e) = handle_client(node, stream).await {
                 tracing::error!(node = %node_port, peer = %peer, error = ?e, "Client connection error");
             }
@@ -149,6 +183,8 @@ pub async fn run(
     storage_root: PathBuf,
     fsync_mode: FsyncMode,
     auth_token: AuthToken,
+    idle_timeout: Duration,
+    max_conns: u32,
 ) -> Result<(), AnyErr> {
     let (node, listener, _addr) = bind(
         bind_addr,
@@ -158,6 +194,8 @@ pub async fn run(
         true,
         fsync_mode,
         auth_token,
+        idle_timeout,
+        max_conns,
     )
     .await?;
     serve(node, listener).await;
@@ -206,7 +244,23 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
 
     loop {
         line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        // Per-command idle timeout. A misbehaving or buggy client that
+        // opens a connection and stops reading/writing can't hold this
+        // task indefinitely. The OS-level TCP keepalive eventually closes
+        // the socket but that can take hours; this is the application-
+        // layer bound. (NEXT_STEPS.md §2.6.)
+        let read = if node.idle_timeout.is_zero() {
+            reader.read_line(&mut line).await
+        } else {
+            match tokio::time::timeout(node.idle_timeout, reader.read_line(&mut line)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = writer.write_all(b"ERR idle timeout\n").await;
+                    return Ok(());
+                }
+            }
+        };
+        if read? == 0 {
             break;
         }
 
@@ -1385,7 +1439,14 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
                 // Acquire-on-spawn would defeat ordered pipelining; acquire
                 // inside the task so FuturesOrdered can buffer up to CAP
                 // pending tasks while the writer drains in order.
-                let _permit = sem.acquire_owned().await.expect("semaphore closed");
+                //
+                // The expect is documented-unreachable: `sem` is a local
+                // Arc owned by `pull_file_from_ring` and not exposed past
+                // the function. Semaphores only return `Closed` after an
+                // explicit `close()` call, which we never make.
+                let _permit = sem.acquire_owned().await.expect(
+                    "semaphore is local to pull_file_from_ring; never closed",
+                );
                 let r = request_chunk_from(&owner_addr, &chunk_name, &token).await;
                 (i, chunk_name, owner_addr, owner_port, r)
             }

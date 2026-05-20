@@ -220,6 +220,8 @@ async fn netmap_get_empty_state_returns_empty_marker() {
         false,
         FsyncMode::None,
         AuthToken::disabled(),
+        Duration::ZERO,
+        0,
     )
     .await
     .unwrap();

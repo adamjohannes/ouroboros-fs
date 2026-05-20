@@ -112,6 +112,15 @@ pub struct Node {
     /// disabled (test default), the AUTH handshake is skipped entirely.
     pub auth_token: AuthToken,
 
+    /// Per-connection idle timeout. The accept-loop wraps each
+    /// `read_line` call so a client that opens a TCP connection and then
+    /// stops sending bytes can't hold a tokio task forever. Zero disables.
+    pub idle_timeout: Duration,
+
+    /// Cap on concurrent client connections. Connections beyond this get
+    /// `ERR server busy\n` and a prompt close. Zero disables.
+    pub max_conns: u32,
+
     /// Counts how many times this node has called `broadcast_netmap_update`.
     /// Useful for tests that want to assert "exactly one broadcast per dead
     /// host"; also provides a cheap debug signal in production.
@@ -127,6 +136,8 @@ impl Node {
         respawn_dead: bool,
         fsync_mode: FsyncMode,
         auth_token: AuthToken,
+        idle_timeout: Duration,
+        max_conns: u32,
     ) -> Arc<Self> {
         let network_nodes = RwLock::new(HashMap::new());
 
@@ -145,6 +156,8 @@ impl Node {
             respawn_dead: AtomicBool::new(respawn_dead),
             fsync_mode,
             auth_token,
+            idle_timeout,
+            max_conns,
             netmap_broadcasts: AtomicU64::new(0),
         })
     }
@@ -565,6 +578,8 @@ mod tests {
             false,
             FsyncMode::None,
             AuthToken::disabled(),
+            Duration::ZERO,
+            0,
         )
     }
 

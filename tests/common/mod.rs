@@ -50,6 +50,8 @@ pub struct RingOpts {
     pub max_file_size: u64,
     pub fsync_mode: FsyncMode,
     pub auth_token: AuthToken,
+    pub idle_timeout: Duration,
+    pub max_conns: u32,
 }
 
 impl Default for RingOpts {
@@ -63,6 +65,10 @@ impl Default for RingOpts {
             fsync_mode: FsyncMode::None,
             // Tests opt out of wire auth; auth-specific tests opt in.
             auth_token: AuthToken::disabled(),
+            // Tests opt out of idle timeout; the timeout test opts in.
+            idle_timeout: Duration::ZERO,
+            // Tests opt out of connection caps; the cap test opts in.
+            max_conns: 0,
         }
     }
 }
@@ -88,6 +94,8 @@ pub async fn spin_up(opts: RingOpts) -> Ring {
             /*respawn_dead=*/ false,
             opts.fsync_mode,
             opts.auth_token.clone(),
+            opts.idle_timeout,
+            opts.max_conns,
         )
         .await
         .expect("bind");
