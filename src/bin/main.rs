@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use libc;
 use ouroboros_fs::{AuthToken, FsyncMode, run};
+use serde::Deserialize;
 use std::{env, error::Error, fs, path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -28,9 +29,80 @@ enum LogFormat {
     Json,
 }
 
+/// TOML schema for `--config` on `Cmd::Run`. Every field is `Option<T>` so
+/// the file may set any subset; missing fields fall through to built-in
+/// defaults. CLI flags override file values. (NEXT_STEPS.md §4.5.)
+#[derive(Default, Deserialize)]
+struct RunConfig {
+    addr: Option<String>,
+    wait_time: Option<u64>,
+    file_size: Option<u64>,
+    storage_root: Option<PathBuf>,
+    fsync_mode: Option<CliFsyncMode>,
+    auth_token: Option<String>,
+    idle_timeout: Option<u64>,
+    max_conns: Option<u32>,
+    shutdown_timeout: Option<u64>,
+}
+
+/// TOML schema for `--config` on `Cmd::Gateway`. The file's top-level
+/// table is `[gateway]` so a single config file can describe both run and
+/// gateway sections; we only deserialize `[gateway]` here.
+#[derive(Default, Deserialize)]
+struct GatewayConfig {
+    listen: Option<String>,
+    #[serde(default)]
+    nodes: Vec<String>,
+    auth_token: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct GatewayConfigWrapper {
+    #[serde(default)]
+    gateway: GatewayConfig,
+}
+
+#[derive(Default, Deserialize)]
+struct RunConfigWrapper {
+    #[serde(default)]
+    run: RunConfig,
+}
+
+fn load_run_config(path: &Path) -> Result<RunConfig, Box<dyn Error + Send + Sync>> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("read config {}: {e}", path.display()))?;
+    // Accept either `[run]` table or top-level keys for back-compat with
+    // simple deployments.
+    if raw.contains("[run]") {
+        let w: RunConfigWrapper = toml::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        Ok(w.run)
+    } else {
+        let cfg: RunConfig = toml::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        Ok(cfg)
+    }
+}
+
+fn load_gateway_config(path: &Path) -> Result<GatewayConfig, Box<dyn Error + Send + Sync>> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("read config {}: {e}", path.display()))?;
+    if raw.contains("[gateway]") {
+        let w: GatewayConfigWrapper = toml::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        Ok(w.gateway)
+    } else {
+        let cfg: GatewayConfig = toml::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        Ok(cfg)
+    }
+}
+
 /// CLI mirror of `FsyncMode` so clap can derive a `--fsync-mode` value parser
-/// without adding a `clap` dep to the library crate.
-#[derive(Copy, Clone, Debug, ValueEnum)]
+/// without adding a `clap` dep to the library crate. Also Deserialize so
+/// the same enum works in TOML config files.
+#[derive(Copy, Clone, Debug, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum CliFsyncMode {
     None,
     Data,
@@ -49,62 +121,65 @@ impl From<CliFsyncMode> for FsyncMode {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a single node (server)
+    /// Run a single node (server). Any flag may also be set via
+    /// `--config <toml>`; explicit CLI flags always win.
     Run {
+        /// Path to a TOML config file. Provides defaults for any flag
+        /// the user doesn't pass on the command line. Built-in defaults
+        /// fill in anything the file doesn't set either.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Address to bind. If omitted, see --port, then $PORT, then default.
         #[arg(long)]
         addr: Option<String>,
         /// Provide only the port, and host defaults to 127.0.0.1
         #[arg(short, long)]
         port: Option<u16>,
-        /// Time (ms) between health checks to the next node. 0 to disable. Defaults to 5 seconds.
-        #[arg(long, default_value_t = 5000u64)]
-        wait_time: u64,
-        /// Max file size in bytes. 0 to disable. Defaults to 1 gigabyte.
-        #[arg(short, long, default_value_t = 1_000_000_000u64)]
-        file_size: u64,
+        /// Time (ms) between health checks to the next node. 0 to disable. Defaults to 5000.
+        #[arg(long)]
+        wait_time: Option<u64>,
+        /// Max file size in bytes. 0 to disable. Defaults to 1_000_000_000.
+        #[arg(short, long)]
+        file_size: Option<u64>,
         /// Filesystem root under which `<port>/content/` and `<port>/backup/`
         /// directories live. Defaults to `nodes` relative to the cwd. The
         /// healer passes this explicitly when respawning a dead neighbor so
         /// the new process inherits the original on-disk chunks.
-        #[arg(long, default_value = "nodes")]
-        storage_root: PathBuf,
-        /// Durability of chunk writes: none|data|full. Defaults to full
-        /// (file fsync + parent-dir fsync per chunk).
-        #[arg(long, value_enum, default_value_t = CliFsyncMode::Full)]
-        fsync_mode: CliFsyncMode,
+        #[arg(long)]
+        storage_root: Option<PathBuf>,
+        /// Durability of chunk writes: none|data|full. Defaults to full.
+        #[arg(long, value_enum)]
+        fsync_mode: Option<CliFsyncMode>,
         /// Pre-shared key (64 hex chars / 32 bytes) for the wire-protocol
-        /// AUTH handshake. Falls back to the OUROBOROS_AUTH_TOKEN env var.
-        /// If neither is set, auth is DISABLED — only acceptable for
-        /// single-host development.
+        /// AUTH handshake. Falls back to the OUROBOROS_AUTH_TOKEN env var
+        /// and then to the config file. Disabled if none of those is set.
         #[arg(long)]
         auth_token: Option<String>,
-        /// Per-connection idle timeout in seconds. A client that holds
-        /// an open TCP connection without sending any bytes for this long
-        /// is dropped. 0 disables. Defaults to 60.
-        #[arg(long, default_value_t = 60u64)]
-        idle_timeout: u64,
+        /// Per-connection idle timeout in seconds. 0 disables. Defaults to 60.
+        #[arg(long)]
+        idle_timeout: Option<u64>,
         /// Max concurrent client connections. 0 disables. Defaults to 1024.
-        #[arg(long, default_value_t = 1024u32)]
-        max_conns: u32,
-        /// Graceful-shutdown drain timeout in seconds. On SIGTERM/SIGINT
-        /// the node stops accepting new connections and waits up to this
-        /// long for in-flight handlers to finish before aborting them.
-        /// Defaults to 30.
-        #[arg(long, default_value_t = 30u64)]
-        shutdown_timeout: u64,
+        #[arg(long)]
+        max_conns: Option<u32>,
+        /// Graceful-shutdown drain timeout in seconds. Defaults to 30.
+        #[arg(long)]
+        shutdown_timeout: Option<u64>,
     },
 
     /// Run a standalone gateway pointed at one or more existing ring
     /// nodes. Use this in production: each ring node is its own systemd
     /// unit, the gateway is its own unit. (See samples/systemd/.)
     Gateway {
+        /// Path to a TOML config file. Same precedence rules as `run`.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Address the gateway listens on for HTTP + TCP-proxy clients.
-        #[arg(long, default_value = "127.0.0.1:8000")]
-        listen: String,
+        /// Defaults to 127.0.0.1:8000.
+        #[arg(long)]
+        listen: Option<String>,
         /// Ring node addresses. Pass multiple `--node` flags. The
         /// gateway tries each in order until one connects.
-        #[arg(long = "node", required = true, num_args = 1..)]
+        #[arg(long = "node", num_args = 1..)]
         nodes: Vec<String>,
         /// Pre-shared bearer/AUTH token (64-char hex). Falls back to the
         /// OUROBOROS_AUTH_TOKEN env var. Disabled if neither is set.
@@ -173,6 +248,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     match cli.command {
         Cmd::Run {
+            config,
             addr,
             port,
             wait_time,
@@ -184,15 +260,44 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             max_conns,
             shutdown_timeout,
         } => {
-            let bind = resolve_listen_addr(addr, port);
+            // Load config file if --config was passed; otherwise an empty
+            // (all-None) struct fills nothing and the built-in defaults
+            // apply for everything.
+            let cfg: RunConfig = if let Some(p) = &config {
+                load_run_config(p)?
+            } else {
+                RunConfig::default()
+            };
+            // Precedence: CLI > config > built-in default.
+            let addr_or_port = addr.is_some() || port.is_some();
+            let bind_str = if addr_or_port {
+                resolve_listen_addr(addr, port)
+            } else if let Some(a) = cfg.addr.clone() {
+                normalize_addr(a)
+            } else {
+                resolve_listen_addr(None, None) // env or default
+            };
+            let wait_time = wait_time.or(cfg.wait_time).unwrap_or(5000);
+            let file_size = file_size.or(cfg.file_size).unwrap_or(1_000_000_000);
+            let storage_root = storage_root
+                .or(cfg.storage_root.clone())
+                .unwrap_or_else(|| PathBuf::from("nodes"));
+            let fsync_mode_cli: CliFsyncMode = fsync_mode
+                .or(cfg.fsync_mode)
+                .unwrap_or(CliFsyncMode::Full);
+            let token_str = auth_token.or(cfg.auth_token.clone());
+            let idle_timeout = idle_timeout.or(cfg.idle_timeout).unwrap_or(60);
+            let max_conns = max_conns.or(cfg.max_conns).unwrap_or(1024);
+            let shutdown_timeout = shutdown_timeout.or(cfg.shutdown_timeout).unwrap_or(30);
+
             let gossip_interval = Duration::from_millis(wait_time);
-            let token = resolve_auth_token(auth_token)?;
+            let token = resolve_auth_token(token_str)?;
             run(
-                &bind,
+                &bind_str,
                 gossip_interval,
                 file_size,
                 storage_root,
-                fsync_mode.into(),
+                fsync_mode_cli.into(),
                 token,
                 Duration::from_secs(idle_timeout),
                 max_conns,
@@ -201,12 +306,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .await
         }
         Cmd::Gateway {
+            config,
             listen,
             nodes,
             auth_token,
         } => {
-            let token = resolve_auth_token(auth_token)?;
-            let gateway = ouroboros_fs::Gateway::with_auth(nodes, token);
+            let cfg: GatewayConfig = if let Some(p) = &config {
+                load_gateway_config(p)?
+            } else {
+                GatewayConfig::default()
+            };
+            let listen = listen
+                .or(cfg.listen.clone())
+                .unwrap_or_else(|| "127.0.0.1:8000".to_string());
+            // Nodes: CLI fully replaces config when any are passed (this
+            // matches `--node` semantics — clap appends; no easy way to
+            // signal "use config-only"). Empty Vec from CLI falls back to
+            // config; empty config plus empty CLI errors.
+            let node_addrs = if !nodes.is_empty() {
+                nodes
+            } else if !cfg.nodes.is_empty() {
+                cfg.nodes
+            } else {
+                return Err("no ring nodes configured: pass --node or set [gateway].nodes in --config".into());
+            };
+            let token = resolve_auth_token(auth_token.or(cfg.auth_token))?;
+            let gateway = ouroboros_fs::Gateway::with_auth(node_addrs, token);
             tracing::info!(addr = %listen, "Starting standalone gateway");
             gateway.run_server(listen).await?;
             Ok(())

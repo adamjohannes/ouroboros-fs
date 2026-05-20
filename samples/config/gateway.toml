@@ -1,0 +1,11 @@
+# Sample gateway config.
+#
+#     ouroboros_fs gateway --config /etc/ouroboros/gateway.toml
+
+listen = "127.0.0.1:8000"
+nodes = [
+    "127.0.0.1:7000",
+    "127.0.0.1:7001",
+    "127.0.0.1:7002",
+]
+# auth_token = "..."   # prefer OUROBOROS_AUTH_TOKEN env var

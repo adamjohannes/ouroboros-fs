@@ -1,0 +1,30 @@
+# Sample run config (NEXT_STEPS.md §4.5).
+#
+# Pass to a node with:
+#     ouroboros_fs run --config /etc/ouroboros/node.toml
+#
+# CLI flags always win over config-file values, which always win over
+# built-in defaults. Any field below may be omitted to take the default.
+#
+# Two equivalent file shapes are accepted:
+#   1) Top-level keys (this file).
+#   2) `[run]` table — useful when one TOML file describes both `run`
+#      and `gateway`. Example:
+#          [run]
+#          addr = "127.0.0.1:7000"
+#          [gateway]
+#          listen = "127.0.0.1:8000"
+
+addr = "127.0.0.1:7000"
+storage_root = "/var/lib/ouroboros/7000"
+wait_time = 5000              # ms
+file_size = 1_000_000_000     # 1 GB
+fsync_mode = "full"            # none | data | full
+idle_timeout = 60              # seconds
+max_conns = 1024
+shutdown_timeout = 30          # seconds
+
+# Auth token can also be read from the OUROBOROS_AUTH_TOKEN env var.
+# Storing secrets in a config file is fine if the file is mode 0600 and
+# owned by the service user; using systemd EnvironmentFile= is cleaner.
+# auth_token = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"

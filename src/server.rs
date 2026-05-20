@@ -68,8 +68,9 @@ pub async fn bind(
     tracing::info!(node = %node.port, "Node listening");
 
     let port_only = port_str(&node.port);
-    let content_dir = node.storage_root.join(port_only).join("content");
-    let backup_dir = node.storage_root.join(port_only).join("backup");
+    let per_node_dir = node.storage_root.join(port_only);
+    let content_dir = per_node_dir.join("content");
+    let backup_dir = per_node_dir.join("backup");
 
     if let Err(e) = fs::create_dir_all(&content_dir).await {
         tracing::error!(node = %node.port, dir = %content_dir.display(), error = ?e, "Failed to create node content directory");
@@ -79,6 +80,11 @@ pub async fn bind(
         tracing::error!(node = %node.port, dir = %backup_dir.display(), error = ?e, "Failed to create node backup directory");
         return Err(e.into());
     }
+
+    // Storage-format version marker (NEXT_STEPS.md §4.7). Series B
+    // (per-chunk SHA-256 trailer) broke compatibility with pre-v1 chunks;
+    // refuse to start on a tree whose format we can't safely read.
+    enforce_storage_version(&per_node_dir, &content_dir, &backup_dir).await?;
 
     if let Err(e) = sweep_orphan_partials(&content_dir).await {
         tracing::warn!(node = %node.port, dir = %content_dir.display(), error = ?e, "Janitor failed sweeping orphan partials in content/");
@@ -108,6 +114,82 @@ async fn sweep_orphan_partials(dir: &std::path::Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Current on-disk format version. Bump when the layout changes in a way
+/// that prior versions can't read. Series B (SHA-256 trailer per chunk)
+/// established v1; pre-Series-B trees have no marker.
+const STORAGE_VERSION: u32 = 1;
+
+/// Read or write the per-node `VERSION` file. Refuses to start when:
+///   - VERSION exists and contains anything other than the current
+///     `STORAGE_VERSION` → operator must run a migration or wipe.
+///   - VERSION is absent AND the chunk dirs are non-empty → unversioned
+///     legacy data; refuse unless `OUROBOROS_FORCE_V1` is set in env.
+///
+/// On a fresh tree (just-created empty dirs), writes the marker cleanly.
+/// (NEXT_STEPS.md §4.7.)
+async fn enforce_storage_version(
+    per_node_dir: &std::path::Path,
+    content_dir: &std::path::Path,
+    backup_dir: &std::path::Path,
+) -> Result<(), AnyErr> {
+    let version_path = per_node_dir.join("VERSION");
+    match fs::read_to_string(&version_path).await {
+        Ok(raw) => {
+            let v: u32 = raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("storage VERSION file is not a u32: {raw:?}"))?;
+            if v != STORAGE_VERSION {
+                return Err(format!(
+                    "storage version mismatch: expected {STORAGE_VERSION}, found {v}; \
+                     run a migration or wipe `{}`",
+                    per_node_dir.display()
+                )
+                .into());
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No marker. Either fresh tree (write it) or legacy data
+            // (refuse unless explicitly forced).
+            let content_empty = is_dir_empty(content_dir).await?;
+            let backup_empty = is_dir_empty(backup_dir).await?;
+            let forced = std::env::var("OUROBOROS_FORCE_V1").is_ok();
+            if !content_empty || !backup_empty {
+                if !forced {
+                    return Err(format!(
+                        "unversioned storage tree at `{}` contains chunks; \
+                         pre-Series-B chunks are not readable. \
+                         Either wipe and re-push, or set OUROBOROS_FORCE_V1=1 \
+                         to assert this tree is already v1-format.",
+                        per_node_dir.display()
+                    )
+                    .into());
+                }
+                tracing::warn!(
+                    dir = %per_node_dir.display(),
+                    "OUROBOROS_FORCE_V1 set; writing version marker over existing chunks"
+                );
+            }
+            fs::write(&version_path, format!("{STORAGE_VERSION}\n"))
+                .await
+                .map_err(|e| -> AnyErr { e.into() })?;
+            tracing::info!(
+                dir = %per_node_dir.display(),
+                version = STORAGE_VERSION,
+                "Wrote storage version marker"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn is_dir_empty(dir: &std::path::Path) -> std::io::Result<bool> {
+    let mut entries = fs::read_dir(dir).await?;
+    Ok(entries.next_entry().await?.is_none())
 }
 
 /// Drive a bound node: spawn the gossip loop and run the accept loop forever.

@@ -70,6 +70,141 @@ async fn no_partial_files_remain_after_push() {
     shutdown(ring).await;
 }
 
+/// §4.7: a fresh tree gets a `VERSION` file written on first bind.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_writes_version_marker_on_fresh_tree() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().join("ring");
+    let (_node, listener, addr) = bind(
+        "127.0.0.1:0",
+        Duration::ZERO,
+        1 << 20,
+        storage.clone(),
+        false,
+        FsyncMode::None,
+        AuthToken::disabled(),
+        Duration::ZERO,
+        0,
+    )
+    .await
+    .unwrap();
+    drop(listener);
+    let version_path = storage.join(addr.port().to_string()).join("VERSION");
+    assert!(version_path.exists(), "VERSION not written");
+    let contents = std::fs::read_to_string(&version_path).unwrap();
+    assert_eq!(contents.trim(), "1");
+}
+
+/// §4.7: re-binding an existing v1 tree succeeds (re-reads the marker).
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_succeeds_on_existing_v1_tree() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().join("ring");
+    // First bind writes the marker.
+    let (_node, listener, addr) = bind(
+        "127.0.0.1:0",
+        Duration::ZERO,
+        1 << 20,
+        storage.clone(),
+        false,
+        FsyncMode::None,
+        AuthToken::disabled(),
+        Duration::ZERO,
+        0,
+    )
+    .await
+    .unwrap();
+    let port = addr.port();
+    drop(listener);
+
+    // Re-bind on the same port must succeed.
+    let (_n2, _l2, _a2) = bind(
+        &format!("127.0.0.1:{port}"),
+        Duration::ZERO,
+        1 << 20,
+        storage.clone(),
+        false,
+        FsyncMode::None,
+        AuthToken::disabled(),
+        Duration::ZERO,
+        0,
+    )
+    .await
+    .expect("re-bind should accept v1 tree");
+}
+
+/// §4.7: a tree whose `VERSION` doesn't match `STORAGE_VERSION` is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_refuses_wrong_version() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().join("ring");
+    // Pick an arbitrary port for the per-node dir.
+    let port = 18761u16;
+    let per_node = storage.join(port.to_string());
+    std::fs::create_dir_all(per_node.join("content")).unwrap();
+    std::fs::create_dir_all(per_node.join("backup")).unwrap();
+    std::fs::write(per_node.join("VERSION"), "99\n").unwrap();
+
+    let result = bind(
+        &format!("127.0.0.1:{port}"),
+        Duration::ZERO,
+        1 << 20,
+        storage.clone(),
+        false,
+        FsyncMode::None,
+        AuthToken::disabled(),
+        Duration::ZERO,
+        0,
+    )
+    .await;
+    assert!(result.is_err(), "expected bind to refuse v99 tree");
+    let msg = result.err().unwrap().to_string();
+    assert!(
+        msg.contains("storage version mismatch"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// §4.7: a tree with chunks but no VERSION file is refused (legacy data
+/// from before the marker was introduced; ambiguous format).
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_refuses_unversioned_existing_tree() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().join("ring");
+    let port = 18762u16;
+    let per_node = storage.join(port.to_string());
+    std::fs::create_dir_all(per_node.join("content")).unwrap();
+    std::fs::create_dir_all(per_node.join("backup")).unwrap();
+    // Drop a fake chunk to simulate legacy data.
+    std::fs::write(per_node.join("content").join("legacy.bin"), b"x").unwrap();
+
+    // Ensure escape hatch isn't set for this test process.
+    // (env::set_var is unsafe in 2024 edition; we use the safe-ish
+    // remove first to be certain.)
+    unsafe {
+        std::env::remove_var("OUROBOROS_FORCE_V1");
+    }
+
+    let result = bind(
+        &format!("127.0.0.1:{port}"),
+        Duration::ZERO,
+        1 << 20,
+        storage.clone(),
+        false,
+        FsyncMode::None,
+        AuthToken::disabled(),
+        Duration::ZERO,
+        0,
+    )
+    .await;
+    assert!(result.is_err(), "expected bind to refuse unversioned tree");
+    let msg = result.err().unwrap().to_string();
+    assert!(
+        msg.contains("unversioned"),
+        "unexpected error: {msg}"
+    );
+}
+
 /// Pre-create an orphan `<chunk>.partial` in a node's content dir, then bind
 /// the node fresh. The startup janitor must remove the orphan.
 #[tokio::test(flavor = "multi_thread")]
