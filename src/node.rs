@@ -67,7 +67,11 @@ pub struct FileTag {
 /// - `next_port`: configured next hop (if any).
 /// - WALK uses a token->oneshot table at the start node.
 /// - FILE push also uses token->oneshot at the start node (to confirm loop).
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually to redact sensitive fields (auth token,
+/// file_tags map, network_nodes map, storage_root). This prevents a
+/// future `tracing::error!(?node, ...)` from leaking the full state to
+/// log shippers. (NEXT_STEPS.md §2.5.)
 pub struct Node {
     /// Where this node is listening
     pub port: String,
@@ -132,6 +136,21 @@ pub struct Node {
     pub pulls_total: AtomicU64,
     pub chunk_bytes_written_total: AtomicU64,
     pub chunk_bytes_read_total: AtomicU64,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("port", &self.port)
+            .field("auth_token", &self.auth_token) // already redacts itself
+            .field("fsync_mode", &self.fsync_mode)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_conns", &self.max_conns)
+            // Sensitive fields (storage_root, network_nodes, file_tags,
+            // topology_map, pending_walks, pending_heals) are deliberately
+            // omitted; see the type doc for the rationale.
+            .finish_non_exhaustive()
+    }
 }
 
 impl Node {
@@ -920,5 +939,46 @@ mod tests {
         node.broadcast_netmap_update().await;
         let after = node.netmap_broadcasts.load(Ordering::Relaxed);
         assert_eq!(after - before, 1);
+    }
+
+    /// §3.4 contract: tokens issued by different nodes must never collide.
+    /// `next_token` prefixes with the node's port, so two nodes on
+    /// different ports produce disjoint streams. The roadmap flagged a
+    /// theoretical collision; this test pins that it can't happen.
+    #[test]
+    fn walk_tokens_disjoint_across_nodes() {
+        use std::collections::HashSet;
+        let a = test_node("127.0.0.1:7000");
+        let b = test_node("127.0.0.1:7001");
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..32 {
+            assert!(seen.insert(a.make_walk_token()));
+            assert!(seen.insert(b.make_walk_token()));
+            assert!(seen.insert(a.make_invest_token()));
+            assert!(seen.insert(b.make_invest_token()));
+        }
+        // Each token must contain its issuer's port so cross-node
+        // collisions are impossible by construction.
+        assert!(a.make_walk_token().starts_with("127.0.0.1:7000-"));
+        assert!(b.make_invest_token().starts_with("127.0.0.1:7001-"));
+    }
+
+    /// §2.5 contract: `Node`'s Debug impl must not leak the file_tags
+    /// map, network_nodes map, storage_root path, or any other field that
+    /// could contain user-visible names. Pinning the redacted shape so a
+    /// future `#[derive(Debug)]` regression doesn't sneak through.
+    #[test]
+    fn node_debug_redacts_sensitive_fields() {
+        let n = test_node("127.0.0.1:7000");
+        let dbg = format!("{n:?}");
+        // Things that must NOT appear:
+        assert!(!dbg.contains("file_tags"), "leaked file_tags: {dbg}");
+        assert!(!dbg.contains("network_nodes"), "leaked network_nodes: {dbg}");
+        assert!(!dbg.contains("storage_root"), "leaked storage_root: {dbg}");
+        assert!(!dbg.contains("topology_map"), "leaked topology_map: {dbg}");
+        assert!(!dbg.contains("/tmp/"), "leaked filesystem path: {dbg}");
+        // Things we expect to see (port is public; useful in logs):
+        assert!(dbg.contains("port"), "missing port in debug: {dbg}");
+        assert!(dbg.contains("7000"), "missing port value: {dbg}");
     }
 }
