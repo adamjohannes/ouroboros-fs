@@ -87,6 +87,12 @@ enum Cmd {
         /// Max concurrent client connections. 0 disables. Defaults to 1024.
         #[arg(long, default_value_t = 1024u32)]
         max_conns: u32,
+        /// Graceful-shutdown drain timeout in seconds. On SIGTERM/SIGINT
+        /// the node stops accepting new connections and waits up to this
+        /// long for in-flight handlers to finish before aborting them.
+        /// Defaults to 30.
+        #[arg(long, default_value_t = 30u64)]
+        shutdown_timeout: u64,
     },
 
     /// Spawn N nodes and stitch them into a ring
@@ -156,6 +162,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             auth_token,
             idle_timeout,
             max_conns,
+            shutdown_timeout,
         } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
@@ -169,6 +176,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 token,
                 Duration::from_secs(idle_timeout),
                 max_conns,
+                Duration::from_secs(shutdown_timeout),
             )
             .await
         }

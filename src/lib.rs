@@ -13,4 +13,4 @@ pub use protocol::{Command, parse_line};
 pub use server::run;
 
 #[doc(hidden)]
-pub use server::{bind, serve};
+pub use server::{bind, serve, serve_with_shutdown};

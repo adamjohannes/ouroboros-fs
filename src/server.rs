@@ -113,6 +113,29 @@ async fn sweep_orphan_partials(dir: &std::path::Path) -> std::io::Result<()> {
 /// Drive a bound node: spawn the gossip loop and run the accept loop forever.
 /// Returns when the listener is dropped (e.g. the calling task is aborted).
 pub async fn serve(node: Arc<Node>, listener: TcpListener) {
+    // No shutdown signal — the task runs until aborted by the caller.
+    // Tests rely on this for fast teardown via `JoinHandle::abort`.
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    serve_with_shutdown(node, listener, rx, Duration::ZERO).await;
+}
+
+/// Like [`serve`], but stops accepting new connections when `shutdown`
+/// fires and then awaits in-flight handlers up to `drain_timeout`. Returns
+/// after the drain completes (or times out).
+///
+/// `drain_timeout == ZERO` means "wait forever" — use this only when you
+/// trust handlers to finish promptly. Production deployments pass the
+/// configured `--shutdown-timeout` (default 30 s in the binary).
+///
+/// The `shutdown` channel firing OR being dropped both trigger the drain;
+/// dropping is the back-compat path used by [`serve`] above.
+/// (NEXT_STEPS.md §4.3.)
+pub async fn serve_with_shutdown(
+    node: Arc<Node>,
+    listener: TcpListener,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    drain_timeout: Duration,
+) {
     if node.gossip_interval > Duration::from_millis(0) {
         let gossip_node = Arc::clone(&node);
         tokio::spawn(async move {
@@ -135,46 +158,82 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
         None
     };
 
+    let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+
+    // Accept loop with a select between accept() and the shutdown channel.
+    // On shutdown: stop accepting, fall through to drain. Dropping the
+    // sender (back-compat) yields RecvError which we treat as shutdown.
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(node = %node.port, error = ?e, "Accept failed; serve loop exiting");
-                return;
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!(node = %node.port, "Shutdown signal received; stopping accept loop");
+                break;
             }
-        };
-        let node = Arc::clone(&node);
-        let node_port = node.port.clone();
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(node = %node.port, error = ?e, "Accept failed; serve loop exiting");
+                        break;
+                    }
+                };
+                let node = Arc::clone(&node);
+                let node_port = node.port.clone();
 
-        // Try to grab a connection slot. If saturated, briefly inform
-        // the client and drop. We use try_acquire (non-blocking) on
-        // purpose: queueing connections in this task would defeat the
-        // cap (it bounds in-flight handlers, not queued ones).
-        let permit = match &conn_sem {
-            None => None,
-            Some(sem) => match Arc::clone(sem).try_acquire_owned() {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    tracing::warn!(node = %node_port, peer = %peer, "Refusing connection: max_conns saturated");
-                    let mut s = stream;
-                    let _ = s.write_all(b"ERR server busy\n").await;
-                    continue;
-                }
-            },
-        };
+                let permit = match &conn_sem {
+                    None => None,
+                    Some(sem) => match Arc::clone(sem).try_acquire_owned() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            tracing::warn!(node = %node_port, peer = %peer, "Refusing connection: max_conns saturated");
+                            let mut s = stream;
+                            let _ = s.write_all(b"ERR server busy\n").await;
+                            continue;
+                        }
+                    },
+                };
 
-        tokio::spawn(async move {
-            // Hold the permit for the lifetime of the handler. Drop
-            // releases it back to the semaphore.
-            let _permit = permit;
-            if let Err(e) = handle_client(node, stream).await {
-                tracing::error!(node = %node_port, peer = %peer, error = ?e, "Client connection error");
+                handlers.spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = handle_client(node, stream).await {
+                        tracing::error!(node = %node_port, peer = %peer, error = ?e, "Client connection error");
+                    }
+                });
             }
-        });
+        }
+    }
+
+    // Drain phase. `drain_timeout == ZERO` means wait indefinitely — used
+    // by the back-compat `serve` path so test aborts still kill the task
+    // instantly via JoinHandle::abort.
+    let drain = async {
+        while handlers.join_next().await.is_some() {}
+    };
+    if drain_timeout.is_zero() {
+        drain.await;
+    } else {
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(()) => {
+                tracing::info!(node = %node.port, "Graceful drain complete");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    node = %node.port,
+                    timeout = ?drain_timeout,
+                    pending = handlers.len(),
+                    "Drain timeout reached; aborting in-flight handlers"
+                );
+                handlers.abort_all();
+                while handlers.join_next().await.is_some() {}
+            }
+        }
     }
 }
 
-/// Run a single ring node: bind, then serve forever. Used by the binary;
+/// Run a single ring node: bind, then serve until SIGTERM/SIGINT, then
+/// drain in-flight handlers up to `shutdown_timeout`. Used by the binary;
 /// tests use [`bind`] + [`serve`] directly.
 pub async fn run(
     bind_addr: &str,
@@ -185,6 +244,7 @@ pub async fn run(
     auth_token: AuthToken,
     idle_timeout: Duration,
     max_conns: u32,
+    shutdown_timeout: Duration,
 ) -> Result<(), AnyErr> {
     let (node, listener, _addr) = bind(
         bind_addr,
@@ -198,8 +258,41 @@ pub async fn run(
         max_conns,
     )
     .await?;
-    serve(node, listener).await;
+
+    // Wire SIGTERM (orchestrator) and SIGINT (interactive Ctrl-C) into a
+    // single oneshot. Whichever fires first wins; the other is dropped.
+    // (NEXT_STEPS.md §4.3.)
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = tx.send(());
+    });
+
+    serve_with_shutdown(node, listener, rx, shutdown_timeout).await;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to install SIGTERM handler; falling back to ctrl_c only");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => tracing::info!("SIGTERM received; beginning graceful shutdown"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received; beginning graceful shutdown"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("Ctrl-C received; beginning graceful shutdown");
 }
 
 async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr> {
