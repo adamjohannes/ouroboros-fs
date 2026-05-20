@@ -5,7 +5,7 @@ pub mod protocol;
 pub mod server;
 
 pub use gateway::Gateway;
-pub use node::Node;
+pub use node::{FsyncMode, Node};
 pub use node_status::NodeStatus;
 pub use protocol::{Command, parse_line};
 pub use server::run;

@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tracing;
 
 use crate::{
-    node::{self, Node, append_edge, port_str},
+    node::{self, FsyncMode, Node, append_edge, port_str},
     protocol::{self, validate_filename},
 };
 
@@ -32,6 +32,7 @@ pub async fn bind(
     file_size: u64,
     storage_root: PathBuf,
     respawn_dead: bool,
+    fsync_mode: FsyncMode,
 ) -> Result<(Arc<Node>, TcpListener, std::net::SocketAddr), AnyErr> {
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
@@ -55,6 +56,7 @@ pub async fn bind(
         file_size,
         storage_root,
         respawn_dead,
+        fsync_mode,
     );
     tracing::info!(node = %node.port, "Node listening");
 
@@ -71,9 +73,34 @@ pub async fn bind(
         return Err(e.into());
     }
 
+    if let Err(e) = sweep_orphan_partials(&content_dir).await {
+        tracing::warn!(node = %node.port, dir = %content_dir.display(), error = ?e, "Janitor failed sweeping orphan partials in content/");
+    }
+    if let Err(e) = sweep_orphan_partials(&backup_dir).await {
+        tracing::warn!(node = %node.port, dir = %backup_dir.display(), error = ?e, "Janitor failed sweeping orphan partials in backup/");
+    }
+
     tracing::info!(node = %node.port, content_dir = %content_dir.display(), backup_dir = %backup_dir.display(), "Created node directories");
 
     Ok((node, listener, local))
+}
+
+/// Remove `*.partial` files from a chunk directory. These are leftovers from
+/// a crash mid-write: `durably_write_chunk` writes to `<name>.partial` and
+/// renames atomically to `<name>` only after a full `sync_all`. Anything that
+/// kept its `.partial` suffix is junk by definition.
+async fn sweep_orphan_partials(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("partial") {
+            tracing::warn!(file = %path.display(), "Removing orphan partial chunk");
+            if let Err(e) = fs::remove_file(&path).await {
+                tracing::warn!(file = %path.display(), error = ?e, "Failed to remove orphan partial");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Drive a bound node: spawn the gossip loop and run the accept loop forever.
@@ -112,13 +139,19 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) {
 
 /// Run a single ring node: bind, then serve forever. Used by the binary;
 /// tests use [`bind`] + [`serve`] directly.
-pub async fn run(bind_addr: &str, gossip_interval: Duration, file_size: u64) -> Result<(), AnyErr> {
+pub async fn run(
+    bind_addr: &str,
+    gossip_interval: Duration,
+    file_size: u64,
+    fsync_mode: FsyncMode,
+) -> Result<(), AnyErr> {
     let (node, listener, _addr) = bind(
         bind_addr,
         gossip_interval,
         file_size,
         PathBuf::from("nodes"),
         true,
+        fsync_mode,
     )
     .await?;
     serve(node, listener).await;
@@ -688,6 +721,55 @@ async fn handle_netmap_get<W: AsyncWrite + Unpin>(
 
 // --- FILE CHUNKING helpers
 
+/// Write a chunk's bytes to `<dir>/<final_name>` with crash safety.
+///
+/// 1. Copy exactly `size` bytes from `reader` into `<dir>/<final_name>.partial`.
+/// 2. `sync_all()` the file if `mode >= Data`.
+/// 3. `rename(2)` to `<dir>/<final_name>`. POSIX rename is atomic within a
+///    directory, so a crash either leaves the `.partial` (cleaned by the
+///    startup janitor) or leaves the final file intact.
+/// 4. `sync_all()` the directory file descriptor if `mode == Full`, so the
+///    directory entry survives a power loss between rename and OS writeback.
+///
+/// Returns the body length actually copied (matches `size` on success).
+async fn durably_write_chunk<R: AsyncRead + Unpin>(
+    dir: &std::path::Path,
+    final_name: &str,
+    reader: &mut R,
+    size: u64,
+    mode: FsyncMode,
+) -> std::io::Result<u64> {
+    let final_path = dir.join(final_name);
+    let partial_path = dir.join(format!("{final_name}.partial"));
+
+    let mut written = 0u64;
+    {
+        let mut f = tokio::fs::File::create(&partial_path).await?;
+        if size > 0 {
+            let mut limited = reader.take(size);
+            written = tokio::io::copy(&mut limited, &mut f).await?;
+        }
+        f.flush().await?;
+        if mode.syncs_file() {
+            f.sync_all().await?;
+        }
+    }
+    fs::rename(&partial_path, &final_path).await?;
+    if mode.syncs_dir() {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            // Open the directory and fsync it. The std handle's `sync_all`
+            // works on directories on Unix; on non-Unix it's a no-op,
+            // which matches the documented platform support.
+            let f = std::fs::File::open(&dir)?;
+            f.sync_all()
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    }
+    Ok(written)
+}
+
 fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
     // Distribute remainder to the first (total_size % parts) chunks
     let base = total_size / parts as u64;
@@ -750,15 +832,11 @@ where
     // `fanout_push_parts_eq_one` pins.
     if parts == 1 {
         let chunk_name = chunk_file_name(&name, 0, parts);
-        let path = node
+        let dir = node
             .storage_root
             .join(port_str(&node.port))
-            .join("content")
-            .join(&chunk_name);
-        let mut f = tokio::fs::File::create(&path).await?;
-        let mut limited = (&mut *reader).take(size);
-        copy(&mut limited, &mut f).await?;
-        f.flush().await?;
+            .join("content");
+        durably_write_chunk(&dir, &chunk_name, &mut *reader, size, node.fsync_mode).await?;
 
         let node_clone = Arc::clone(&node);
         let cn = chunk_name.clone();
@@ -835,18 +913,12 @@ where
     // here; chunks 1..parts-1 stream straight to the corresponding
     // outbound conn (zero buffering on the start node).
     let chunk0_name = chunk_file_name(&name, 0, parts);
-    let chunk0_path = node
+    let content_dir = node
         .storage_root
         .join(port_str(&node.port))
-        .join("content")
-        .join(&chunk0_name);
-    let mut chunk0 = tokio::fs::File::create(&chunk0_path).await?;
+        .join("content");
     let len0 = fair_chunk_len(0, size, parts);
-    {
-        let mut limited = (&mut *reader).take(len0);
-        copy(&mut limited, &mut chunk0).await?;
-    }
-    chunk0.flush().await?;
+    durably_write_chunk(&content_dir, &chunk0_name, &mut *reader, len0, node.fsync_mode).await?;
 
     // Backup chunk 0 to predecessor.
     let node_clone = Arc::clone(&node);
@@ -943,23 +1015,17 @@ where
     node.set_file_tag(&parent_name, start_port, file_size, parts)
         .await;
 
-    let path = node
+    let dir = node
         .storage_root
         .join(port_str(&node.port))
-        .join("content")
-        .join(&name);
-    let mut file = tokio::fs::File::create(&path).await?;
-    if chunk_size > 0 {
-        let mut limited = reader.take(chunk_size);
-        copy(&mut limited, &mut file).await?;
-    }
-    file.flush().await?;
+        .join("content");
+    durably_write_chunk(&dir, &name, reader, chunk_size, node.fsync_mode).await?;
 
     tracing::info!(
         node = %node.port,
         chunk = index + 1,
         parts,
-        file = %path.display(),
+        file = %dir.join(&name).display(),
         bytes = chunk_size,
         "Stored fan-out chunk"
     );
@@ -1063,28 +1129,18 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let dest_path = node
+    let dir = node
         .storage_root
         .join(port_str(&node.port))
-        .join("backup")
-        .join(&name);
-
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).await.ok();
-    }
-
-    let mut f = tokio::fs::File::create(&dest_path).await?;
-    if size > 0 {
-        let mut limited = reader.take(size);
-        copy(&mut limited, &mut f).await?;
-    }
-    f.flush().await?;
+        .join("backup");
+    fs::create_dir_all(&dir).await.ok();
+    durably_write_chunk(&dir, &name, reader, size, node.fsync_mode).await?;
 
     tracing::info!(
         node = %node.port,
         chunk = %name,
         bytes = size,
-        path = %dest_path.display(),
+        path = %dir.join(&name).display(),
         "Backup chunk received and stored (push)."
     );
 

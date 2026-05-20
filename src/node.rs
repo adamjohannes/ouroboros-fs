@@ -16,6 +16,44 @@ use tokio::{
 };
 use tracing;
 
+/// Durability mode for chunk writes.
+///
+/// - `None`: no fsync. The kernel may write back lazily; a power loss
+///   between flush and writeback loses recent chunks. Test default.
+/// - `Data`: `fsync(file)` after each chunk write. Survives kernel panics
+///   and most power events; on some filesystems the directory entry can
+///   still be lost.
+/// - `Full`: `fsync(file)` plus `fsync(dir)` after each rename, so the
+///   directory entry is also durably committed. Production default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsyncMode {
+    None,
+    Data,
+    #[default]
+    Full,
+}
+
+impl FsyncMode {
+    pub fn syncs_file(self) -> bool {
+        matches!(self, Self::Data | Self::Full)
+    }
+    pub fn syncs_dir(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+impl std::str::FromStr for FsyncMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "data" => Ok(Self::Data),
+            "full" => Ok(Self::Full),
+            other => Err(format!("invalid fsync mode '{other}': use none|data|full")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileTag {
     pub start: u16,
@@ -66,6 +104,9 @@ pub struct Node {
     /// Tests set this to false; the binary keeps it true.
     pub respawn_dead: AtomicBool,
 
+    /// fsync policy for chunk writes; see [`FsyncMode`].
+    pub fsync_mode: FsyncMode,
+
     /// Counts how many times this node has called `broadcast_netmap_update`.
     /// Useful for tests that want to assert "exactly one broadcast per dead
     /// host"; also provides a cheap debug signal in production.
@@ -79,6 +120,7 @@ impl Node {
         file_size: u64,
         storage_root: PathBuf,
         respawn_dead: bool,
+        fsync_mode: FsyncMode,
     ) -> Arc<Self> {
         let network_nodes = RwLock::new(HashMap::new());
 
@@ -95,6 +137,7 @@ impl Node {
             topology_map: RwLock::new(HashMap::new()),
             storage_root,
             respawn_dead: AtomicBool::new(respawn_dead),
+            fsync_mode,
             netmap_broadcasts: AtomicU64::new(0),
         })
     }
@@ -474,7 +517,7 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, append_edge, host_str, parse_entries, port_str, serialize_entries};
+    use super::{FsyncMode, Node, append_edge, host_str, parse_entries, port_str, serialize_entries};
     use crate::NodeStatus;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -491,6 +534,7 @@ mod tests {
             1 << 30,
             PathBuf::from("/tmp/ouroboros_unit_unused"),
             false,
+            FsyncMode::None,
         )
     }
 

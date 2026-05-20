@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ouroboros_fs::{Node, bind, serve};
+use ouroboros_fs::{FsyncMode, Node, bind, serve};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_chacha::ChaCha20Rng;
@@ -36,6 +36,11 @@ impl Ring {
     pub fn addr(&self, idx: usize) -> SocketAddr {
         self.nodes[idx].addr
     }
+    /// Path to the per-Ring TempDir; tests that need to scan on-disk state
+    /// (durability checks, janitor verification) can walk from here.
+    pub fn _tmp_path(&self) -> std::path::PathBuf {
+        self._tmp.path().to_path_buf()
+    }
 }
 
 #[derive(Clone)]
@@ -43,6 +48,7 @@ pub struct RingOpts {
     pub n: usize,
     pub gossip_interval: Duration,
     pub max_file_size: u64,
+    pub fsync_mode: FsyncMode,
 }
 
 impl Default for RingOpts {
@@ -52,6 +58,8 @@ impl Default for RingOpts {
             // Gossip disabled by default — failover tests opt in.
             gossip_interval: Duration::ZERO,
             max_file_size: 1 << 30,
+            // Tests opt out of fsync for speed; the fsync_full test opts in.
+            fsync_mode: FsyncMode::None,
         }
     }
 }
@@ -75,6 +83,7 @@ pub async fn spin_up(opts: RingOpts) -> Ring {
             opts.max_file_size,
             storage,
             /*respawn_dead=*/ false,
+            opts.fsync_mode,
         )
         .await
         .expect("bind");

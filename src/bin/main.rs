@@ -1,6 +1,6 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use libc;
-use ouroboros_fs::run;
+use ouroboros_fs::{FsyncMode, run};
 use std::{env, error::Error, fs, path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -15,6 +15,25 @@ use tracing_subscriber::{EnvFilter, fmt};
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
+}
+
+/// CLI mirror of `FsyncMode` so clap can derive a `--fsync-mode` value parser
+/// without adding a `clap` dep to the library crate.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CliFsyncMode {
+    None,
+    Data,
+    Full,
+}
+
+impl From<CliFsyncMode> for FsyncMode {
+    fn from(m: CliFsyncMode) -> Self {
+        match m {
+            CliFsyncMode::None => FsyncMode::None,
+            CliFsyncMode::Data => FsyncMode::Data,
+            CliFsyncMode::Full => FsyncMode::Full,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -33,6 +52,10 @@ enum Cmd {
         /// Max file size in bytes. 0 to disable. Defaults to 1 gigabyte.
         #[arg(short, long, default_value_t = 1_000_000_000u64)]
         file_size: u64,
+        /// Durability of chunk writes: none|data|full. Defaults to full
+        /// (file fsync + parent-dir fsync per chunk).
+        #[arg(long, value_enum, default_value_t = CliFsyncMode::Full)]
+        fsync_mode: CliFsyncMode,
     },
 
     /// Spawn N nodes and stitch them into a ring
@@ -83,10 +106,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             port,
             wait_time,
             file_size,
+            fsync_mode,
         } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
-            run(&bind, gossip_interval, file_size).await
+            run(&bind, gossip_interval, file_size, fsync_mode.into()).await
         }
         Cmd::SetNetwork {
             nodes,
