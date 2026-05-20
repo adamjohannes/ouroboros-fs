@@ -1,0 +1,48 @@
+# Sample systemd unit for the OuroborosFS gateway.
+#
+# Install at /etc/systemd/system/ouroboros-gateway.service.
+#
+#     systemctl daemon-reload
+#     systemctl enable --now ouroboros-gateway
+#
+# Edit the --node flags below to point at your ring's actual addresses.
+# The gateway tries each in order until one connects, so list multiple
+# for HA — even if you only run on one host today.
+
+[Unit]
+Description=OuroborosFS gateway (HTTP + TCP proxy)
+After=network-online.target ouroboros-node@7000.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ouroboros
+Group=ouroboros
+
+# OUROBOROS_AUTH_TOKEN must match what the ring nodes use.
+EnvironmentFile=-/etc/default/ouroboros
+
+ExecStart=/usr/local/bin/ouroboros_fs gateway \
+    --listen 127.0.0.1:8000 \
+    --node 127.0.0.1:7000 \
+    --node 127.0.0.1:7001 \
+    --node 127.0.0.1:7002 \
+    --log-format json
+
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

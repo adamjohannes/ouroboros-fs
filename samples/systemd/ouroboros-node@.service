@@ -1,0 +1,66 @@
+# Sample systemd unit for an OuroborosFS ring node.
+#
+# Install at /etc/systemd/system/ouroboros-node@.service. Each node is
+# launched as `ouroboros-node@<port>.service`; %i expands to the port.
+#
+# Ring of 3 nodes on ports 7000-7002:
+#
+#     systemctl daemon-reload
+#     systemctl enable --now ouroboros-node@7000 \
+#                            ouroboros-node@7001 \
+#                            ouroboros-node@7002
+#
+# Then wire the ring once (NODE NEXT). The gateway's TCP-proxy mode
+# (samples/systemd/ouroboros-gateway.service) handles the wiring; or
+# do it manually with `nc` or the test harness.
+#
+# Auth token: set OUROBOROS_AUTH_TOKEN in /etc/default/ouroboros (or
+# wherever you prefer). The unit reads it via EnvironmentFile=.
+
+[Unit]
+Description=OuroborosFS node on port %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ouroboros
+Group=ouroboros
+
+# OUROBOROS_AUTH_TOKEN, RUST_LOG, etc.
+EnvironmentFile=-/etc/default/ouroboros
+
+ExecStart=/usr/local/bin/ouroboros_fs run \
+    --addr 127.0.0.1:%i \
+    --storage-root /var/lib/ouroboros/%i \
+    --fsync-mode full \
+    --max-conns 1024 \
+    --idle-timeout 60 \
+    --shutdown-timeout 30 \
+    --log-format json
+
+# Graceful shutdown: SIGTERM triggers the in-flight handler drain
+# (see --shutdown-timeout above). Give systemd a small buffer past
+# the drain deadline before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=on-failure
+RestartSec=5
+
+# Security hardening — these are best-effort defaults; loosen as needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ouroboros
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

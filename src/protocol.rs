@@ -6,6 +6,7 @@
 //!   - "NODE NEXT <addr>" (client -> any node)
 //!   - "NODE STATUS"      (client -> any node)
 //!   - "NODE PING"        (node -> node)
+//!   - "NODE METRICS"     (gateway -> node; aggregated /metrics source)
 //!   - "NODE HEAL"        (client -> any node)
 //!   - "NODE HEAL-HOP <token> <start_addr>" (node -> node)
 //!   - "NODE HEAL-DONE <token>"             (last node -> start node)
@@ -83,6 +84,7 @@ pub enum Command {
     NodeNext(String), // NODE NEXT <addr>
     NodeStatus,       // NODE STATUS
     NodePing,         // NODE PING
+    NodeMetrics,      // NODE METRICS
     NodeHeal,         // "NODE HEAL" (client)
     NodeHealHop {
         token: String,
@@ -207,6 +209,9 @@ fn parse_node_cmd(rest: &str) -> Result<Command, String> {
     }
     if rest.eq_ignore_ascii_case("PING") {
         return Ok(Command::NodePing);
+    }
+    if rest.eq_ignore_ascii_case("METRICS") {
+        return Ok(Command::NodeMetrics);
     }
     if rest.eq_ignore_ascii_case("HEAL") {
         return Ok(Command::NodeHeal);

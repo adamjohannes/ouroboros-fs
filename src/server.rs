@@ -366,6 +366,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 }
                 protocol::Command::NodeStatus => handle_node_status(&node, &mut writer).await?,
                 protocol::Command::NodePing => handle_node_ping(&mut writer).await?,
+                protocol::Command::NodeMetrics => handle_node_metrics(&node, &mut writer).await?,
                 protocol::Command::NodeHeal => {
                     handle_node_heal(Arc::clone(&node), &mut writer).await?
                 }
@@ -501,6 +502,49 @@ async fn handle_node_status<W: AsyncWrite + Unpin>(
 
 async fn handle_node_ping<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), AnyErr> {
     writer.write_all(b"PONG\n").await?;
+    Ok(())
+}
+
+/// Emit per-node Prometheus-friendly counters as a list of `<key>=<value>`
+/// lines, terminated by `OK`. The gateway reads these from each ring node
+/// and aggregates into the Prometheus text format at `GET /metrics`.
+async fn handle_node_metrics<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    use std::sync::atomic::Ordering;
+    let (alive_nodes, dead_nodes) = node.alive_dead_counts().await;
+    let port = port_str(&node.port);
+    let lines = [
+        format!("port={}", port),
+        format!(
+            "pushes_total={}",
+            node.pushes_total.load(Ordering::Relaxed)
+        ),
+        format!(
+            "pulls_total={}",
+            node.pulls_total.load(Ordering::Relaxed)
+        ),
+        format!(
+            "chunk_bytes_written_total={}",
+            node.chunk_bytes_written_total.load(Ordering::Relaxed)
+        ),
+        format!(
+            "chunk_bytes_read_total={}",
+            node.chunk_bytes_read_total.load(Ordering::Relaxed)
+        ),
+        format!(
+            "netmap_broadcasts_total={}",
+            node.netmap_broadcasts.load(Ordering::Relaxed)
+        ),
+        format!("alive_nodes={}", alive_nodes),
+        format!("dead_nodes={}", dead_nodes),
+    ];
+    for l in &lines {
+        writer.write_all(l.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    writer.write_all(b"OK\n").await?;
     Ok(())
 }
 
@@ -1070,6 +1114,12 @@ where
         return Ok(());
     }
 
+    // Metrics: count this PUSH and the bytes it accepts.
+    node.pushes_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    node.chunk_bytes_written_total
+        .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+
     debug_assert!(validate_filename(&name).is_ok(), "unvalidated name {name:?}");
 
     let parts: u32 = node.network_size().await as u32;
@@ -1322,6 +1372,15 @@ async fn handle_file_pull<W: AsyncWrite + Unpin>(
     let file_size = tag.size;
     let start_addr = format!("{}:{}", host_of(&node.port), start_port);
     drop(tags);
+
+    // Metrics: count this PULL and the bytes it (eventually) emits.
+    // Counted before streaming starts so a partial PULL is still
+    // reflected in the byte counter — operators can compare against
+    // the chunk-bytes-written counter to spot truncation.
+    node.pulls_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    node.chunk_bytes_read_total
+        .fetch_add(file_size, std::sync::atomic::Ordering::Relaxed);
 
     // Stream each chunk straight to the client (no full-file Vec).
     pull_file_from_ring(node, &name, &start_addr, parts, file_size, writer).await

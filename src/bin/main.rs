@@ -95,8 +95,28 @@ enum Cmd {
         shutdown_timeout: u64,
     },
 
-    /// Spawn N nodes and stitch them into a ring
-    SetNetwork {
+    /// Run a standalone gateway pointed at one or more existing ring
+    /// nodes. Use this in production: each ring node is its own systemd
+    /// unit, the gateway is its own unit. (See samples/systemd/.)
+    Gateway {
+        /// Address the gateway listens on for HTTP + TCP-proxy clients.
+        #[arg(long, default_value = "127.0.0.1:8000")]
+        listen: String,
+        /// Ring node addresses. Pass multiple `--node` flags. The
+        /// gateway tries each in order until one connects.
+        #[arg(long = "node", required = true, num_args = 1..)]
+        nodes: Vec<String>,
+        /// Pre-shared bearer/AUTH token (64-char hex). Falls back to the
+        /// OUROBOROS_AUTH_TOKEN env var. Disabled if neither is set.
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
+
+    /// Spawn N nodes and stitch them into a ring. Development helper —
+    /// for production deploy, use `run` for each node + `gateway` for
+    /// the entry point. The legacy `set-network` name still works.
+    #[command(alias = "set-network")]
+    DevNetwork {
         /// Number of nodes to start
         #[arg(short = 'n', long = "nodes", default_value_t = 3)]
         nodes: u16,
@@ -180,7 +200,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             )
             .await
         }
-        Cmd::SetNetwork {
+        Cmd::Gateway {
+            listen,
+            nodes,
+            auth_token,
+        } => {
+            let token = resolve_auth_token(auth_token)?;
+            let gateway = ouroboros_fs::Gateway::with_auth(nodes, token);
+            tracing::info!(addr = %listen, "Starting standalone gateway");
+            gateway.run_server(listen).await?;
+            Ok(())
+        }
+        Cmd::DevNetwork {
             nodes,
             base_port,
             host,

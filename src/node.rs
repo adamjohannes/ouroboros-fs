@@ -125,6 +125,13 @@ pub struct Node {
     /// Useful for tests that want to assert "exactly one broadcast per dead
     /// host"; also provides a cheap debug signal in production.
     pub netmap_broadcasts: AtomicU64,
+
+    /// Prometheus metrics counters. Names mirror the labels emitted by
+    /// the gateway's `/metrics` endpoint. (NEXT_STEPS.md §4.2.)
+    pub pushes_total: AtomicU64,
+    pub pulls_total: AtomicU64,
+    pub chunk_bytes_written_total: AtomicU64,
+    pub chunk_bytes_read_total: AtomicU64,
 }
 
 impl Node {
@@ -159,6 +166,10 @@ impl Node {
             idle_timeout,
             max_conns,
             netmap_broadcasts: AtomicU64::new(0),
+            pushes_total: AtomicU64::new(0),
+            pulls_total: AtomicU64::new(0),
+            chunk_bytes_written_total: AtomicU64::new(0),
+            chunk_bytes_read_total: AtomicU64::new(0),
         })
     }
 
@@ -490,6 +501,20 @@ impl Node {
 impl Node {
     pub async fn update_node_status(&self, port: String, status: NodeStatus) {
         self.network_nodes.write().await.insert(port, status);
+    }
+
+    /// (alive_count, dead_count) snapshot. Used by the metrics handler.
+    pub async fn alive_dead_counts(&self) -> (u64, u64) {
+        let map = self.network_nodes.read().await;
+        let mut alive = 0u64;
+        let mut dead = 0u64;
+        for v in map.values() {
+            match v {
+                NodeStatus::Alive => alive += 1,
+                NodeStatus::Dead => dead += 1,
+            }
+        }
+        (alive, dead)
     }
 
     pub async fn get_network_nodes_entries(&self) -> String {

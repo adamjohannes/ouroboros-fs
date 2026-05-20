@@ -141,12 +141,21 @@ impl Gateway {
         if method == "GET" && (path == "/health" || path == "/ready") {
             return self.handle_health_request(writer, path).await;
         }
+        // /metrics is bearer-protected (it leaks per-node activity counters
+        // a casual scanner shouldn't see). Counterargument: most prom
+        // scrapers can't easily carry a Bearer either. We follow the
+        // /file/list convention and require auth — operators add the
+        // token to the scrape config.
         if method != "OPTIONS"
             && !self
                 .auth_token
                 .verify_bearer(headers.get("authorization").map(String::as_str))
         {
             return Self::send_error_response(writer, 401, "Unauthorized").await;
+        }
+
+        if method == "GET" && path == "/metrics" {
+            return self.handle_metrics_request(writer).await;
         }
 
         // Handle GET /file/pull/<filename>
@@ -244,6 +253,90 @@ impl Gateway {
         }
     }
 
+
+    /// `/metrics` — Prometheus text format aggregated across all ring
+    /// nodes. Each per-node counter is emitted with a `node="<port>"`
+    /// label so scrapers can sum across the cluster while keeping the
+    /// per-node breakdown. Unreachable nodes are skipped (their metrics
+    /// just don't appear); the gateway never serves stale cached data.
+    /// (NEXT_STEPS.md §4.2.)
+    async fn handle_metrics_request(
+        self: Arc<Self>,
+        writer: &mut (impl AsyncWrite + Unpin),
+    ) -> io::Result<()> {
+        let per_node = self.fetch_metrics().await;
+        let body = Self::render_prometheus(&per_node);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain; version=0.0.4\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            body
+        );
+        writer.write_all(response.as_bytes()).await
+    }
+
+    /// Hit every node concurrently with `NODE METRICS`; collect parsed
+    /// `<key>=<value>` lines. Nodes that fail to respond are silently
+    /// dropped — their absence in the output is the signal.
+    async fn fetch_metrics(&self) -> Vec<(String, Vec<(String, u64)>)> {
+        let mut tasks: Vec<JoinHandle<Option<(String, Vec<(String, u64)>)>>> = Vec::new();
+        for addr in self.node_addrs.clone() {
+            let token = self.auth_token.clone();
+            tasks.push(tokio::spawn(Self::scrape_node_metrics(addr, token)));
+        }
+        let mut out = Vec::new();
+        for t in tasks {
+            if let Ok(Some(entry)) = t.await {
+                out.push(entry);
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    async fn scrape_node_metrics(
+        addr: String,
+        token: AuthToken,
+    ) -> Option<(String, Vec<(String, u64)>)> {
+        let timeout = Duration::from_millis(500);
+        let port = port_str(&addr).to_string();
+        let lines = tokio::time::timeout(timeout, async {
+            let mut s = TcpStream::connect(&addr).await.ok()?;
+            if let Some(line) = token.make_auth_line() {
+                s.write_all(line.as_bytes()).await.ok()?;
+            }
+            s.write_all(b"NODE METRICS\n").await.ok()?;
+            let (r, _w) = s.split();
+            let mut reader = BufReader::new(r);
+            let mut accum: Vec<(String, u64)> = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await.ok()?;
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed == "OK" {
+                    break;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    if let Ok(val) = v.parse::<u64>() {
+                        accum.push((k.to_string(), val));
+                    }
+                }
+            }
+            Some(accum)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        Some((port, lines))
+    }
 
     /// line. Returns lowercased keys → trimmed values. The reader is left
     /// positioned at the first byte of the body (if any).
@@ -448,7 +541,45 @@ impl Gateway {
         Ok(filled)
     }
 
-/// Maximum size of the §3.1 truncation trailer. Format is
+/// Render a Prometheus 0.0.4 text-format response from per-node metric
+/// pairs. Each `<key>=<value>` line in the input becomes a labeled
+/// metric; the *_total naming is preserved (Prometheus convention for
+/// counters). The gauge `ouroboros_dead_nodes` gets a `# TYPE gauge`
+/// hint; everything else is a counter.
+fn render_prometheus(per_node: &[(String, Vec<(String, u64)>)]) -> String {
+    use std::collections::BTreeMap;
+
+    // Group by metric name across nodes for stable HELP/TYPE emission.
+    let mut by_metric: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+    for (port, kvs) in per_node {
+        for (k, v) in kvs {
+            if k == "port" {
+                continue;
+            }
+            by_metric.entry(k.clone()).or_default().push((port.clone(), *v));
+        }
+    }
+
+    let mut out = String::new();
+    for (name, samples) in &by_metric {
+        let metric_name = format!("ouroboros_{name}");
+        let mtype = if name.ends_with("_total") {
+            "counter"
+        } else {
+            "gauge"
+        };
+        out.push_str(&format!("# HELP {metric_name} OuroborosFS {name}\n"));
+        out.push_str(&format!("# TYPE {metric_name} {mtype}\n"));
+        for (port, val) in samples {
+            out.push_str(&format!(
+                "{metric_name}{{node=\"{port}\"}} {val}\n"
+            ));
+        }
+    }
+    out
+}
+
+
 /// `\nERR truncated expected=<u64> got=<u64>\n`. Two u64s in decimal cap
 /// at 20 digits each; the literal text adds 32 bytes; round up to 96.
 const MAX_TRAILER_LEN: usize = 96;

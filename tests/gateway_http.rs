@@ -216,6 +216,73 @@ async fn gateway_ready_with_all_dead_ring_returns_503() {
     teardown(ring, gw).await;
 }
 
+/// §4.2: `/metrics` returns Prometheus text format with per-node labels.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_metrics_returns_prometheus_text() {
+    let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
+    let resp = http_get(gw.addr, "/metrics").await.unwrap();
+    assert_eq!(resp.status, 200);
+    let ct = resp.header("Content-Type").unwrap_or_default();
+    assert!(
+        ct.starts_with("text/plain"),
+        "expected text/plain Content-Type; got {ct}"
+    );
+    let body = resp.body_str();
+    // Sanity: standard Prometheus text-format hints + at least one of our
+    // metric names labeled with a node port.
+    assert!(body.contains("# TYPE ouroboros_pushes_total counter"), "body: {body}");
+    assert!(body.contains("ouroboros_pulls_total{node=\""), "body: {body}");
+    teardown(ring, gw).await;
+}
+
+/// §4.2: pushing a file increments `ouroboros_pushes_total`. Aggregated
+/// across nodes, the total goes up by exactly 1 (one start node accepts
+/// the request).
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_metrics_pushes_total_increments_after_push() {
+    let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
+
+    fn extract_total(body: &str, name: &str) -> u64 {
+        let mut sum = 0u64;
+        for line in body.lines() {
+            if line.starts_with(&format!("ouroboros_{name}{{node=")) {
+                if let Some((_, val)) = line.rsplit_once(' ') {
+                    if let Ok(v) = val.parse::<u64>() {
+                        sum += v;
+                    }
+                }
+            }
+        }
+        sum
+    }
+
+    let before = extract_total(
+        &http_get(gw.addr, "/metrics").await.unwrap().body_str(),
+        "pushes_total",
+    );
+    push_bytes(ring.addr(0), "metric.bin", b"hello").await.unwrap();
+    let after = extract_total(
+        &http_get(gw.addr, "/metrics").await.unwrap().body_str(),
+        "pushes_total",
+    );
+    assert_eq!(after, before + 1, "pushes_total should increment by 1");
+    teardown(ring, gw).await;
+}
+
+/// §4.2: `/metrics` requires bearer auth (same convention as `/file/list`).
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_metrics_requires_bearer_when_auth_enabled() {
+    use ouroboros_fs::AuthToken;
+    let (ring, gw) = spin_up_with_gateway(RingOpts {
+        auth_token: AuthToken::from_bytes([0x42; 32]),
+        ..RingOpts::default()
+    })
+    .await;
+    let resp = http_get(gw.addr, "/metrics").await.unwrap();
+    assert_eq!(resp.status, 401);
+    teardown(ring, gw).await;
+}
+
 // ---------- POST /network/heal ----------
 
 #[tokio::test(flavor = "multi_thread")]
