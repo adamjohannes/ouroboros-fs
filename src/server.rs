@@ -146,6 +146,7 @@ pub async fn run(
     bind_addr: &str,
     gossip_interval: Duration,
     file_size: u64,
+    storage_root: PathBuf,
     fsync_mode: FsyncMode,
     auth_token: AuthToken,
 ) -> Result<(), AnyErr> {
@@ -153,7 +154,7 @@ pub async fn run(
         bind_addr,
         gossip_interval,
         file_size,
-        PathBuf::from("nodes"),
+        storage_root,
         true,
         fsync_mode,
         auth_token,
@@ -1315,7 +1316,7 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
     name: &str,
     start_addr: &str,
     parts: u32,
-    _file_size: u64,
+    file_size: u64,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
     use futures::stream::{FuturesOrdered, StreamExt};
@@ -1396,6 +1397,7 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
     //    backup; failed ports are batched and broadcast once at the end so
     //    we don't emit N "Broadcasting node status" lines for one dead host.
     let mut failed_ports: HashSet<String> = HashSet::new();
+    let mut emitted: u64 = 0;
 
     while let Some((_i, chunk_name, owner_addr, owner_port, r)) = tasks.next().await {
         let chunk: Vec<u8> = match r {
@@ -1457,7 +1459,30 @@ async fn pull_file_from_ring<W: AsyncWrite + Unpin>(
 
         if !chunk.is_empty() {
             writer.write_all(&chunk).await?;
+            emitted += chunk.len() as u64;
         }
+    }
+
+    // §3.1 truncation signal: if any chunks fell short, the body is now
+    // shorter than the announced `file_size` from `file_tags`. Append a
+    // trailing line so the puller can detect this without trusting an
+    // external metadata source. The trailer is bytes after the body, so
+    // pure-bytes clients that don't parse trailing data still see the
+    // short body (the existing behavior); aware clients (the gateway,
+    // newer SDKs) can read past EOF and surface the error.
+    if emitted < file_size {
+        let trailer = format!(
+            "\nERR truncated expected={} got={}\n",
+            file_size, emitted
+        );
+        writer.write_all(trailer.as_bytes()).await?;
+        tracing::error!(
+            node = %node.port,
+            file_name = %name,
+            expected = file_size,
+            got = emitted,
+            "PULL produced short output; emitted truncation trailer"
+        );
     }
 
     // 4. Single batch netmap update + broadcast for the dead set, deferred
@@ -1827,7 +1852,13 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
         .arg("--addr")
         .arg(&full_dead_addr)
         .arg("--wait-time")
-        .arg(node.gossip_interval.as_millis().to_string());
+        .arg(node.gossip_interval.as_millis().to_string())
+        // Pass through the storage root explicitly. Without this the
+        // respawned child computes `PathBuf::from("nodes")` relative to
+        // its own cwd and the on-disk content/ + backup/ directories the
+        // dead process was writing to become orphaned. (NEXT_STEPS.md §1.5.)
+        .arg("--storage-root")
+        .arg(&node.storage_root);
 
     // env_clear: don't leak our environment to the respawned child. Pass
     // through only what the child genuinely needs:

@@ -205,9 +205,10 @@ This command will block, holding the network open.
 maximum size of a single accepted file per node. Pass `0` to disable the cap. The same flag exists on
 the `run` subcommand if you start nodes individually.
 
-Each node persists its chunks under `nodes/<port>/content/` and backups under `nodes/<port>/backup/`,
-rooted at the binary's working directory. The `Node` struct internally takes a `storage_root` parameter
-so the in-process test harness can redirect this to a tempdir; the binary always uses `nodes/`.
+Each node persists its chunks under `<storage_root>/<port>/content/` and backups under
+`<storage_root>/<port>/backup/`. The `run` subcommand defaults `--storage-root` to `nodes/`
+relative to the working directory; tests pass a `TempDir`. For production deployments and
+cluster-backup procedure, see [docs/operations.md](docs/operations.md).
 
 ### 3.4. Run the Web Dashboard (Optional)
 

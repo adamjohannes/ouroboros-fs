@@ -636,23 +636,34 @@ pub mod child_ring {
     /// Spawn `n` binaries on `base_port..base_port+n` with gossip 200 ms.
     /// Wires them with `NODE NEXT` after each is reachable. Returns the
     /// `ChildRing` whose KillerGuard cleanup fires on Drop.
-    pub async fn spawn(n: u16, base_port: u16) -> std::io::Result<ChildRing> {
+    ///
+    /// `storage_root`: passed through as `--storage-root <path>` so the
+    /// child writes its on-disk chunks under a known location (and a
+    /// respawned grandchild inherits the same root). Pass `None` to leave
+    /// it at the binary's default (`nodes/` relative to cwd).
+    pub async fn spawn(
+        n: u16,
+        base_port: u16,
+        storage_root: Option<PathBuf>,
+    ) -> std::io::Result<ChildRing> {
         let exe = release_binary();
         let mut children = Vec::with_capacity(n as usize);
         let mut killer_guard = KillerGuard::new();
 
         for i in 0..n {
             let port = base_port + i;
-            let child = Command::new(&exe)
-                .args([
-                    "run",
-                    "--addr",
-                    &format!("127.0.0.1:{port}"),
-                    "--wait-time",
-                    "200",
-                ])
-                .kill_on_drop(true)
-                .spawn()?;
+            let mut cmd = Command::new(&exe);
+            cmd.args([
+                "run",
+                "--addr",
+                &format!("127.0.0.1:{port}"),
+                "--wait-time",
+                "200",
+            ]);
+            if let Some(root) = &storage_root {
+                cmd.arg("--storage-root").arg(root);
+            }
+            let child = cmd.kill_on_drop(true).spawn()?;
             if let Some(pid) = child.id() {
                 killer_guard.record_pid(pid);
             }

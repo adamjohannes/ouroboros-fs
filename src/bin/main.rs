@@ -52,6 +52,12 @@ enum Cmd {
         /// Max file size in bytes. 0 to disable. Defaults to 1 gigabyte.
         #[arg(short, long, default_value_t = 1_000_000_000u64)]
         file_size: u64,
+        /// Filesystem root under which `<port>/content/` and `<port>/backup/`
+        /// directories live. Defaults to `nodes` relative to the cwd. The
+        /// healer passes this explicitly when respawning a dead neighbor so
+        /// the new process inherits the original on-disk chunks.
+        #[arg(long, default_value = "nodes")]
+        storage_root: PathBuf,
         /// Durability of chunk writes: none|data|full. Defaults to full
         /// (file fsync + parent-dir fsync per chunk).
         #[arg(long, value_enum, default_value_t = CliFsyncMode::Full)]
@@ -112,13 +118,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             port,
             wait_time,
             file_size,
+            storage_root,
             fsync_mode,
             auth_token,
         } => {
             let bind = resolve_listen_addr(addr, port);
             let gossip_interval = Duration::from_millis(wait_time);
             let token = resolve_auth_token(auth_token)?;
-            run(&bind, gossip_interval, file_size, fsync_mode.into(), token).await
+            run(
+                &bind,
+                gossip_interval,
+                file_size,
+                storage_root,
+                fsync_mode.into(),
+                token,
+            )
+            .await
         }
         Cmd::SetNetwork {
             nodes,

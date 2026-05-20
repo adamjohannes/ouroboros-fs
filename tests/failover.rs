@@ -38,11 +38,13 @@ async fn failover_kill_one_then_pull() {
 }
 
 /// Adjacent double failure: chunk owner *and* its predecessor (backup
-/// holder) both die. Today's code silently truncates the missing chunk —
-/// regression pin so refactors don't change this in surprising ways.
-/// **Not a bug fix.**
+/// holder) both die. §3.1 contract: when adjacent owner+predecessor failure
+/// makes a chunk permanently unrecoverable, the PULL emits the bytes it
+/// could recover followed by a `\nERR truncated expected=<E> got=<G>\n`
+/// trailer. Aware clients (the gateway, future SDKs) detect the trailer;
+/// pure-byte clients still see a short body.
 #[tokio::test(flavor = "multi_thread")]
-async fn adjacent_double_failure_corruption_pin() {
+async fn adjacent_double_failure_emits_truncation_signal() {
     let mut ring = spin_up(RingOpts {
         n: 5,
         gossip_interval: Duration::from_millis(200),
@@ -55,8 +57,8 @@ async fn adjacent_double_failure_corruption_pin() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Kill chunk owner (2) and its predecessor (1) which holds chunk 2's
-    // backup. PULL should complete (no hang/crash) but the resulting bytes
-    // are short or have a zero-length gap for the missing chunk.
+    // backup. PULL completes but the body is short; we expect a
+    // truncation trailer.
     kill_node(&mut ring, 2).await;
     kill_node(&mut ring, 1).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -65,11 +67,33 @@ async fn adjacent_double_failure_corruption_pin() {
         .await
         .expect("pull should complete even with corruption");
 
+    // The trailer is `\nERR truncated expected=<E> got=<G>\n` appended
+    // after the (short) body. Verify both the short body and the trailer.
+    let trailer_marker = b"\nERR truncated";
+    let trailer_pos = got
+        .windows(trailer_marker.len())
+        .rposition(|w| w == trailer_marker)
+        .expect("expected truncation trailer in PULL response");
+
+    let body = &got[..trailer_pos];
     assert!(
-        got.len() < bytes.len(),
-        "expected truncated/short output; got {} bytes (input {})",
-        got.len(),
+        body.len() < bytes.len(),
+        "body should be shorter than original; got {} vs {}",
+        body.len(),
         bytes.len()
+    );
+
+    let trailer = &got[trailer_pos..];
+    let trailer_str = std::str::from_utf8(trailer).expect("trailer is utf-8");
+    assert!(
+        trailer_str.contains(&format!("expected={}", bytes.len())),
+        "trailer should announce expected size {}: {trailer_str:?}",
+        bytes.len()
+    );
+    assert!(
+        trailer_str.contains(&format!("got={}", body.len())),
+        "trailer should announce actual emitted size {}: {trailer_str:?}",
+        body.len()
     );
 
     shutdown(ring).await;

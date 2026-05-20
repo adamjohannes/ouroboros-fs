@@ -367,6 +367,51 @@ async fn gateway_tcp_proxy_passes_through_file_push_pull() {
     teardown(ring, gw).await;
 }
 
+// ---------- §3.1 truncation through the gateway ----------
+
+/// When the ring emits the `\nERR truncated …\n` trailer, the gateway
+/// strips it from the HTTP body before flushing. Aware operators see the
+/// short body + the server-side `tracing::error!` log; pure-byte clients
+/// just see a short response.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_pull_strips_truncation_trailer_from_body() {
+    let (mut ring, gw) = spin_up_with_gateway(RingOpts {
+        n: 5,
+        gossip_interval: Duration::from_millis(200),
+        ..RingOpts::default()
+    })
+    .await;
+
+    let payload = rand_bytes(/*seed=*/ 700, 256 * 1024);
+    push_bytes(ring.addr(0), "trunc.bin", &payload).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Kill chunk-2 owner + its predecessor (the backup holder). The pull
+    // body is short by chunk-2's length and the ring appends the trailer.
+    common::kill_node(&mut ring, 2).await;
+    common::kill_node(&mut ring, 1).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let resp = http_get(gw.addr, "/file/pull/trunc.bin").await.unwrap();
+    assert_eq!(resp.status, 200);
+
+    // The HTTP body must NOT contain the trailer text — the gateway
+    // strips it before flushing. The body is shorter than the original.
+    assert!(
+        !resp.body.windows(b"ERR truncated".len())
+            .any(|w| w == b"ERR truncated"),
+        "trailer leaked into HTTP body"
+    );
+    assert!(
+        resp.body.len() < payload.len(),
+        "body should be shorter than original; got {} vs {}",
+        resp.body.len(),
+        payload.len()
+    );
+
+    teardown(ring, gw).await;
+}
+
 // ---------- helper ----------
 
 use common::teardown;

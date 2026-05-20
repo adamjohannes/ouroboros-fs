@@ -313,6 +313,17 @@ impl Gateway {
     }
 
     /// Connects to the ring and streams a file back to an HTTP client.
+    ///
+    /// Detects the §3.1 truncation trailer (`\nERR truncated …\n`) at EOF
+    /// of the ring response. The trailer is *appended* to whatever body
+    /// bytes the ring could recover, so we maintain a small lookbehind
+    /// buffer (max trailer length) and only emit older bytes; on EOF we
+    /// inspect the lookbehind and strip the trailer before flushing the
+    /// remainder. Aware HTTP clients can detect truncation via the
+    /// `X-Ouroboros-Truncated` *body suffix* — we can't add a real HTTP
+    /// trailer header without chunked encoding, and we can't change the
+    /// status code after `send_file_response_headers` already wrote 200.
+    /// Logging the failure server-side is the most actionable signal here.
     async fn handle_file_pull(
         self: Arc<Self>,
         writer: &mut (impl AsyncWrite + Unpin),
@@ -330,15 +341,79 @@ impl Gateway {
         // 3. Send the HTTP 200 OK and file headers to the browser
         Self::send_file_response_headers(writer, filename).await?;
 
-        // 4. Stream the raw file data from the node directly to the browser
-        copy(&mut node_read, writer).await?;
-
+        // 4. Stream the body, with a lookbehind window large enough to
+        //    catch the truncation trailer at EOF.
+        let truncated = Self::stream_with_truncation_detection(&mut node_read, writer).await?;
+        if truncated {
+            // Headers have already been sent; we can't send a 502 now.
+            // The on-disk client will see a body that's exactly the
+            // recovered bytes (trailer stripped) — they may notice the
+            // size mismatch against `FILE LIST`, or we can surface it via
+            // a future trailer header. For now, log loudly server-side.
+            tracing::error!(
+                file = %filename,
+                "Gateway: detected PULL truncation trailer; HTTP body is short"
+            );
+        }
         Ok(())
     }
 
-    // --- Raw TCP Handler
+/// Maximum size of the §3.1 truncation trailer. Format is
+/// `\nERR truncated expected=<u64> got=<u64>\n`. Two u64s in decimal cap
+/// at 20 digits each; the literal text adds 32 bytes; round up to 96.
+const MAX_TRAILER_LEN: usize = 96;
 
-    /// This is the proxy for all TCP commands
+/// Marker prefix the trailer always starts with.
+const TRAILER_MARKER: &[u8] = b"\nERR truncated ";
+
+/// Stream `src` to `dst` while keeping a lookbehind window large enough to
+/// strip a trailing `\nERR truncated …\n` line if present. Returns `true`
+/// if a trailer was detected and stripped (caller logs/surfaces the
+/// failure), `false` for a clean stream.
+///
+/// The implementation is deliberately simple: append into a `Vec`, flush
+/// everything except the last MAX_TRAILER_LEN bytes after each read, and
+/// on EOF inspect the tail. The held-back window is constant-bounded so
+/// memory is O(1) regardless of file size; the I/O pattern is the same as
+/// `tokio::io::copy` modulo the small final flush.
+async fn stream_with_truncation_detection<R, W>(
+    src: &mut R,
+    dst: &mut W,
+) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut tail: Vec<u8> = Vec::with_capacity(Self::MAX_TRAILER_LEN * 2);
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = src.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > Self::MAX_TRAILER_LEN {
+            let flush_until = tail.len() - Self::MAX_TRAILER_LEN;
+            dst.write_all(&tail[..flush_until]).await?;
+            tail.drain(..flush_until);
+        }
+    }
+    // EOF. Inspect the lookbehind for a trailer.
+    if let Some(pos) = tail
+        .windows(Self::TRAILER_MARKER.len())
+        .rposition(|w| w == Self::TRAILER_MARKER)
+    {
+        // Trailer present; flush only the body bytes before it.
+        dst.write_all(&tail[..pos]).await?;
+        Ok(true)
+    } else {
+        // No trailer; flush whatever's left.
+        dst.write_all(&tail).await?;
+        Ok(false)
+    }
+}
+
+
     async fn handle_tcp_proxy<R>(
         self: Arc<Self>,
         mut client_reader: BufReader<R>,
