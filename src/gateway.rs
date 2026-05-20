@@ -134,7 +134,13 @@ impl Gateway {
         };
 
         // OPTIONS requests do NOT require auth (browsers send them as
-        // preflight without credentials by design). All other methods do.
+        // preflight without credentials by design). Liveness/readiness
+        // probes likewise don't carry credentials by default in
+        // Kubernetes/Nomad — they short-circuit before the auth check.
+        // All other methods require a valid bearer.
+        if method == "GET" && (path == "/health" || path == "/ready") {
+            return self.handle_health_request(writer, path).await;
+        }
         if method != "OPTIONS"
             && !self
                 .auth_token
@@ -145,13 +151,26 @@ impl Gateway {
 
         // Handle GET /file/pull/<filename>
         if method == "GET" && path.starts_with("/file/pull/") {
-            return if let Some(filename) = path.strip_prefix("/file/pull/") {
-                match self.handle_file_pull(writer, filename).await {
-                    Ok(_) => Ok(()), // Full response was sent
-                    Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
+            // Reject empty filename (`/file/pull/` with nothing after the
+            // last slash) at the gateway, before connecting to the ring.
+            // Same for any traversal-shaped or otherwise-rejected name —
+            // the ring would also reject it but we save the round-trip.
+            // (NEXT_STEPS.md §3.2.)
+            let filename = path.strip_prefix("/file/pull/").unwrap_or("");
+            if filename.is_empty() {
+                return Self::send_error_response(writer, 404, "Not Found: missing filename").await;
+            }
+            return match self.handle_file_pull(writer, filename).await {
+                Ok(_) => Ok(()), // Full response was sent
+                Err(e) => {
+                    let msg = e.to_string();
+                    let status = if msg.starts_with("not found:") {
+                        404
+                    } else {
+                        500
+                    };
+                    Self::send_error_response(writer, status, &msg).await
                 }
-            } else {
-                Self::send_error_response(writer, 400, "Bad Request: Missing filename").await
             };
         }
 
@@ -195,7 +214,37 @@ impl Gateway {
         }
     }
 
-    /// Read HTTP request headers up to (and consuming) the terminating empty
+    /// `/health` — 200 always. Reaching this handler means the gateway's
+    /// accept loop is responsive; liveness probes shouldn't ask for more.
+    /// `/ready` — 200 if ≥ 1 ring node currently PONGs, 503 otherwise.
+    /// Used by orchestrators to gate traffic until the gateway can serve
+    /// at least one request. (NEXT_STEPS.md §4.4.)
+    async fn handle_health_request(
+        self: Arc<Self>,
+        writer: &mut (impl AsyncWrite + Unpin),
+        path: &str,
+    ) -> io::Result<()> {
+        if path == "/health" {
+            return Self::send_json_response(
+                writer,
+                serde_json::json!({"status": "ok"}),
+            )
+            .await;
+        }
+        // /ready
+        let map_result = self.fetch_node_map().await;
+        let any_alive = match map_result {
+            Ok(map) => map.values().any(|s| matches!(s, NodeStatus::Alive)),
+            Err(_) => false,
+        };
+        if any_alive {
+            Self::send_json_response(writer, serde_json::json!({"ready": true})).await
+        } else {
+            Self::send_error_response(writer, 503, "no ring nodes alive").await
+        }
+    }
+
+
     /// line. Returns lowercased keys → trimmed values. The reader is left
     /// positioned at the first byte of the body (if any).
     async fn read_http_headers<R>(
@@ -340,24 +389,63 @@ impl Gateway {
         node_write.write_all(header.as_bytes()).await?;
         node_write.shutdown().await?;
 
-        // 3. Send the HTTP 200 OK and file headers to the browser
+        // 3. Sniff the first few bytes from the ring. If it leads with
+        //    `ERR `, treat as a structured error (404 for "file not
+        //    found", 500 for everything else) and DO NOT emit 200
+        //    headers. Otherwise the bytes are body content; we write
+        //    them through and stream the rest. (NEXT_STEPS.md §3.2.)
+        let mut prefix = [0u8; 4];
+        let n = Self::read_exact_or_eof(&mut node_read, &mut prefix).await?;
+        if n >= 4 && &prefix == b"ERR " {
+            let mut rest = String::new();
+            tokio::io::AsyncBufReadExt::read_line(
+                &mut tokio::io::BufReader::new(&mut node_read),
+                &mut rest,
+            )
+            .await?;
+            let msg = rest.trim_end_matches(['\r', '\n']);
+            let combined = format!("ERR {msg}");
+            return if combined.contains("file not found") {
+                Err(format!("not found: {combined}").into())
+            } else {
+                Err(combined.into())
+            };
+        }
+
+        // 4. Send the HTTP 200 OK and file headers to the browser
         Self::send_file_response_headers(writer, filename).await?;
 
-        // 4. Stream the body, with a lookbehind window large enough to
-        //    catch the truncation trailer at EOF.
+        // 5. Flush the sniffed prefix, then stream the rest with a
+        //    lookbehind window for the truncation trailer at EOF.
+        if n > 0 {
+            writer.write_all(&prefix[..n]).await?;
+        }
         let truncated = Self::stream_with_truncation_detection(&mut node_read, writer).await?;
         if truncated {
-            // Headers have already been sent; we can't send a 502 now.
-            // The on-disk client will see a body that's exactly the
-            // recovered bytes (trailer stripped) — they may notice the
-            // size mismatch against `FILE LIST`, or we can surface it via
-            // a future trailer header. For now, log loudly server-side.
             tracing::error!(
                 file = %filename,
                 "Gateway: detected PULL truncation trailer; HTTP body is short"
             );
         }
         Ok(())
+    }
+
+    /// Read up to `buf.len()` bytes; return how many were filled. Differs
+    /// from `read_exact` in that EOF before filling is not an error — the
+    /// caller decides. Used for the FILE PULL response sniff.
+    async fn read_exact_or_eof<R: AsyncRead + Unpin>(
+        src: &mut R,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = src.read(&mut buf[filled..]).await?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(filled)
     }
 
 /// Maximum size of the §3.1 truncation trailer. Format is

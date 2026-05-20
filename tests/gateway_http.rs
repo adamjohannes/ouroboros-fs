@@ -161,22 +161,58 @@ async fn gateway_get_file_pull_streams_bytes() {
     teardown(ring, gw).await;
 }
 
+/// §3.2 contract: empty filename in `/file/pull/` returns 404 directly,
+/// without contacting the ring. Replaces the pinned bug
+/// `gateway_get_file_pull_missing_filename_path_returns_error_body`.
 #[tokio::test(flavor = "multi_thread")]
-async fn gateway_get_file_pull_missing_filename_path_returns_error_body() {
-    // `/file/pull/` strips the prefix and tries to pull "" — the gateway
-    // already wrote HTTP 200 + headers before checking, so the body becomes
-    // the ring's `ERR file not found` line. Pinning current degraded
-    // behavior; a real fix would 404 before connecting to the ring.
+async fn gateway_get_file_pull_empty_path_returns_404() {
     let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
     let resp = http_get(gw.addr, "/file/pull/").await.unwrap();
-    // Status is 200 (the gateway races the ring's response) — assert that
-    // the body surfaces the ERR.
-    let body = resp.body_str();
-    assert!(
-        body.contains("ERR") || resp.status >= 400,
-        "expected ERR body or 4xx/5xx, got status={} body={body:?}",
-        resp.status
-    );
+    assert_eq!(resp.status, 404, "body: {:?}", resp.body_str());
+    teardown(ring, gw).await;
+}
+
+/// §3.2 contract: pulling a nonexistent file returns 404. The gateway
+/// sniffs the ring's first bytes and translates the `ERR file not found`
+/// line into an HTTP 404 instead of a 200-with-error-body.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_get_file_pull_missing_file_returns_404() {
+    let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
+    let resp = http_get(gw.addr, "/file/pull/does-not-exist.bin").await.unwrap();
+    assert_eq!(resp.status, 404, "body: {:?}", resp.body_str());
+    teardown(ring, gw).await;
+}
+
+/// §4.4: `/health` always 200 when the gateway accepts; bypasses bearer auth.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_health_returns_200() {
+    let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
+    let resp = http_get(gw.addr, "/health").await.unwrap();
+    assert_eq!(resp.status, 200);
+    teardown(ring, gw).await;
+}
+
+/// §4.4: `/ready` 200 when ≥ 1 ring node alive; bypasses bearer auth.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_ready_with_live_ring_returns_200() {
+    let (ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
+    let resp = http_get(gw.addr, "/ready").await.unwrap();
+    assert_eq!(resp.status, 200, "body: {:?}", resp.body_str());
+    teardown(ring, gw).await;
+}
+
+/// §4.4: `/ready` returns 503 when no ring node is reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_ready_with_all_dead_ring_returns_503() {
+    let (mut ring, gw) = spin_up_with_gateway(RingOpts::default()).await;
+    // Kill every node. The gateway can no longer reach any of them.
+    for i in 0..ring.nodes.len() {
+        kill_node(&mut ring, i).await;
+    }
+    // Brief settle so the kills land before the probe.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let resp = http_get(gw.addr, "/ready").await.unwrap();
+    assert_eq!(resp.status, 503, "body: {:?}", resp.body_str());
     teardown(ring, gw).await;
 }
 

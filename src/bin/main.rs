@@ -13,8 +13,19 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Parser)]
 #[command(name = "ouroboros_fs", version, about = "Ring TCP server & tools")]
 struct Cli {
+    /// Log format: text (default, human-readable) or json (one event per
+    /// line, structured fields). JSON suits Splunk/ELK/Datadog ingestion.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text, global = true)]
+    log_format: LogFormat,
+
     #[command(subcommand)]
     command: Cmd,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 /// CLI mirror of `FsyncMode` so clap can derive a `--fsync-mode` value parser
@@ -112,14 +123,28 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Initialize tracing subscriber
-    fmt()
-        .with_timer(fmt::time::UtcTime::rfc_3339()) // Adds RFC 3339 timestamps
-        .with_env_filter(EnvFilter::from_default_env()) // Use RUST_LOG env var
-        .with_target(true)
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize tracing subscriber. JSON suits log shippers; text is for
+    // a human reading `journalctl` or stdout. (NEXT_STEPS.md §4.1.)
+    match cli.log_format {
+        LogFormat::Text => {
+            fmt()
+                .with_timer(fmt::time::UtcTime::rfc_3339())
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_target(true)
+                .init();
+        }
+        LogFormat::Json => {
+            fmt()
+                .with_timer(fmt::time::UtcTime::rfc_3339())
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_target(true)
+                .json()
+                .init();
+        }
+    }
+
     match cli.command {
         Cmd::Run {
             addr,
